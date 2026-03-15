@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts.map
+
+# Secrets - never commit
+credentials.json
+*_token.json
+session_registry.json
+emails_vector.db
