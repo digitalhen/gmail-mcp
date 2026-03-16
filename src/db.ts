@@ -84,6 +84,13 @@ class Database {
     if (result.rowCount && result.rowCount > 0) {
       console.log(`[DB] Cleaned up ${result.rowCount} expired access tokens`);
     }
+    // Clean up stale pending auths and auth codes (older than 10 minutes)
+    await client.query(
+      "DELETE FROM oauth_pending_auths WHERE created_at < NOW() - INTERVAL '10 minutes'"
+    );
+    await client.query(
+      "DELETE FROM oauth_auth_codes WHERE created_at < NOW() - INTERVAL '10 minutes'"
+    );
   }
 
   private async runMigrations(client: PoolClient): Promise<void> {
@@ -229,6 +236,26 @@ class Database {
         date TEXT NOT NULL,
         description TEXT,
         PRIMARY KEY (email_id, date)
+      );
+
+      CREATE TABLE IF NOT EXISTS oauth_pending_auths (
+        google_state TEXT PRIMARY KEY,
+        mcp_client_id TEXT NOT NULL,
+        mcp_redirect_uri TEXT NOT NULL,
+        mcp_state TEXT,
+        mcp_code_challenge TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+        code TEXT PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        google_access_token TEXT,
+        google_refresh_token TEXT,
+        google_expiry_date BIGINT,
+        code_challenge TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
       -- New columns (idempotent with DO NOTHING on error)

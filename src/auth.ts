@@ -22,22 +22,7 @@ const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
 ];
 
-// ─── Short-lived in-memory stores (OK to lose on restart) ───
-
-interface PendingAuth {
-  mcpClientId: string;
-  mcpRedirectUri: string;
-  mcpState?: string;
-  mcpCodeChallenge: string;
-  googleState: string;
-}
-
-// pendingAuths and authCodes are short-lived (5 min TTL during OAuth flow) — in-memory is fine
-const pendingAuths = new Map<string, PendingAuth>();
-const authCodes = new Map<
-  string,
-  { email: string; googleTokens: any; codeChallenge: string; clientId: string }
->();
+// pendingAuths and authCodes now stored in Postgres to survive deploys
 
 export class GmailOAuthProvider implements OAuthServerProvider {
   private serverBaseUrl: string;
@@ -145,16 +130,11 @@ export class GmailOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     const googleState = randomBytes(32).toString("hex");
 
-    pendingAuths.set(googleState, {
-      mcpClientId: client.client_id,
-      mcpRedirectUri: params.redirectUri,
-      mcpState: params.state,
-      mcpCodeChallenge: params.codeChallenge,
-      googleState,
-    });
-
-    // Auto-expire after 5 minutes
-    setTimeout(() => pendingAuths.delete(googleState), 300000);
+    await db.query(
+      `INSERT INTO oauth_pending_auths (google_state, mcp_client_id, mcp_redirect_uri, mcp_state, mcp_code_challenge)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [googleState, client.client_id, params.redirectUri, params.state || null, params.codeChallenge]
+    );
 
     const oauth2Client = this.createGoogleOAuth2Client();
     const googleAuthUrl = oauth2Client.generateAuthUrl({
@@ -174,11 +154,15 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     code: string,
     state: string
   ): Promise<{ redirectUrl: string }> {
-    const pending = pendingAuths.get(state);
-    if (!pending) {
+    const pendingResult = await db.query(
+      "SELECT * FROM oauth_pending_auths WHERE google_state = $1",
+      [state]
+    );
+    if (pendingResult.rows.length === 0) {
       throw new Error("Invalid or expired OAuth state");
     }
-    pendingAuths.delete(state);
+    const pending = pendingResult.rows[0];
+    await db.query("DELETE FROM oauth_pending_auths WHERE google_state = $1", [state]);
 
     const oauth2Client = this.createGoogleOAuth2Client();
     const { tokens } = await oauth2Client.getToken(code);
@@ -189,20 +173,24 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     const email = profile.data.emailAddress!;
 
     const mcpAuthCode = randomBytes(32).toString("hex");
-    authCodes.set(mcpAuthCode, {
-      email,
-      googleTokens: tokens,
-      codeChallenge: pending.mcpCodeChallenge,
-      clientId: pending.mcpClientId,
-    });
+    await db.query(
+      `INSERT INTO oauth_auth_codes (code, user_email, google_access_token, google_refresh_token, google_expiry_date, code_challenge, client_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        mcpAuthCode,
+        email,
+        tokens.access_token,
+        tokens.refresh_token,
+        tokens.expiry_date,
+        pending.mcp_code_challenge,
+        pending.mcp_client_id,
+      ]
+    );
 
-    // Auto-expire auth code after 5 minutes
-    setTimeout(() => authCodes.delete(mcpAuthCode), 300000);
-
-    const redirectUrl = new URL(pending.mcpRedirectUri);
+    const redirectUrl = new URL(pending.mcp_redirect_uri);
     redirectUrl.searchParams.set("code", mcpAuthCode);
-    if (pending.mcpState) {
-      redirectUrl.searchParams.set("state", pending.mcpState);
+    if (pending.mcp_state) {
+      redirectUrl.searchParams.set("state", pending.mcp_state);
     }
 
     console.log(
@@ -215,22 +203,29 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<string> {
-    const record = authCodes.get(authorizationCode);
-    if (!record) {
+    const codeResult = await db.query(
+      "SELECT * FROM oauth_auth_codes WHERE code = $1",
+      [authorizationCode]
+    );
+    if (codeResult.rows.length === 0) {
       throw new Error("Invalid authorization code");
     }
-    return record.codeChallenge;
+    return codeResult.rows[0].code_challenge;
   }
 
   async exchangeAuthorizationCode(
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<OAuthTokens> {
-    const record = authCodes.get(authorizationCode);
-    if (!record) {
+    const codeResult = await db.query(
+      "SELECT * FROM oauth_auth_codes WHERE code = $1",
+      [authorizationCode]
+    );
+    if (codeResult.rows.length === 0) {
       throw new Error("Invalid authorization code");
     }
-    authCodes.delete(authorizationCode);
+    const record = codeResult.rows[0];
+    await db.query("DELETE FROM oauth_auth_codes WHERE code = $1", [authorizationCode]);
 
     const accessToken = randomBytes(32).toString("hex");
     const mcpRefreshToken = randomBytes(32).toString("hex");
@@ -243,11 +238,11 @@ export class GmailOAuthProvider implements OAuthServerProvider {
        VALUES ($1, 'access', $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         accessToken,
-        record.clientId,
-        record.email,
-        record.googleTokens.access_token,
-        record.googleTokens.refresh_token,
-        record.googleTokens.expiry_date,
+        record.client_id,
+        record.user_email,
+        record.google_access_token,
+        record.google_refresh_token,
+        record.google_expiry_date,
         ["gmail"],
         expiresAt,
         mcpRefreshToken,
@@ -259,17 +254,17 @@ export class GmailOAuthProvider implements OAuthServerProvider {
        VALUES ($1, 'refresh', $2, $3, $4, $5, $6, $7, $8)`,
       [
         mcpRefreshToken,
-        record.clientId,
-        record.email,
-        record.googleTokens.access_token,
-        record.googleTokens.refresh_token,
-        record.googleTokens.expiry_date,
+        record.client_id,
+        record.user_email,
+        record.google_access_token,
+        record.google_refresh_token,
+        record.google_expiry_date,
         ["gmail"],
         accessToken,
       ]
     );
 
-    console.log(`Issued MCP tokens for ${record.email}`);
+    console.log(`Issued MCP tokens for ${record.user_email}`);
 
     return {
       access_token: accessToken,
