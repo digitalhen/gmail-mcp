@@ -121,4 +121,22 @@ Status: COMPLETE
 
 ## Sprint 4: Self-Improvement + Corrections
 
+Status: COMPLETE
+
+### What was built
+- `src/corrections.ts` — Correction and self-improvement module:
+  - `assignProject()` — Manual project assignment with correction logging
+  - `mergeProjects()` / `renameProject()` — Project management with correction logging
+  - `recluster()` — Full cycle: consolidate → assign orphans → mark stale projects completed (60 days inactive)
+  - `enrichmentReview()` — Coverage stats, correction counts by type, recent corrections
+- 5 new MCP tools: `gmail_assign_project`, `gmail_merge_projects`, `gmail_rename_project`, `gmail_recluster`, `gmail_enrichment_review`
+
+### Files created/modified
+- Created: src/corrections.ts
+- Modified: src/server.ts (5 new tools + import)
+
+---
+
+## Sprint 5: Indexing Improvements
+
 Status: IN PROGRESS

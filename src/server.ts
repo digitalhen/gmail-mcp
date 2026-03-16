@@ -34,6 +34,13 @@ import {
   projectEmails,
   projectSummary,
 } from "./projects.js";
+import {
+  assignProject,
+  mergeProjects,
+  renameProject,
+  recluster,
+  enrichmentReview,
+} from "./corrections.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -1056,6 +1063,121 @@ function createServer(): McpServer {
         const summary = await projectSummary(email, project_name);
         return {
           content: [{ type: "text", text: summary }],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Sprint 4: Correction + Self-Improvement Tools ───
+
+  server.tool(
+    "gmail_assign_project",
+    "Manually assign an email to a project. Creates the project if it doesn't exist. Logs the correction.",
+    {
+      message_id: z.string().describe("The email message ID"),
+      project_name: z.string().describe("The project name to assign to"),
+    },
+    async ({ message_id, project_name }, extra) => {
+      try {
+        getEmailFromExtra(extra); // auth check
+        const result = await assignProject(message_id, project_name);
+        return { content: [{ type: "text", text: result.message }] };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_merge_projects",
+    "Merge one project into another. Moves all email associations and deletes the source project.",
+    {
+      from_project: z.string().describe("Project name to merge FROM (will be deleted)"),
+      to_project: z.string().describe("Project name to merge INTO (will be kept)"),
+    },
+    async ({ from_project, to_project }, extra) => {
+      try {
+        getEmailFromExtra(extra);
+        const result = await mergeProjects(from_project, to_project);
+        return { content: [{ type: "text", text: result.message }] };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_rename_project",
+    "Rename a project.",
+    {
+      old_name: z.string().describe("Current project name"),
+      new_name: z.string().describe("New project name"),
+    },
+    async ({ old_name, new_name }, extra) => {
+      try {
+        getEmailFromExtra(extra);
+        const result = await renameProject(old_name, new_name);
+        return { content: [{ type: "text", text: result.message }] };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_recluster",
+    "Full improvement cycle: consolidate duplicate projects, assign orphan emails, mark stale projects as completed.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const result = await recluster(email);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ account: email, ...result }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_enrichment_review",
+    "Review enrichment quality: coverage stats, correction patterns, and recent corrections.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const report = await enrichmentReview(email);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ account: email, ...report }, null, 2),
+            },
+          ],
         };
       } catch (error: any) {
         return {
