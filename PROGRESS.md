@@ -67,4 +67,24 @@ Status: COMPLETE
 
 ## Sprint 1: Enrichment Pipeline
 
+Status: COMPLETE
+
+### What was built
+- `src/enrichment.ts` — Enrichment module using Claude Haiku (claude-haiku-4-5-20251001)
+  - Uses the exact enrichment prompt from the spec
+  - Parses JSON response (strips markdown fences if present)
+  - Writes to Postgres in a transaction: email_enrichment, entities, email_entities, email_tags, projects, email_projects
+  - `getEnrichmentStats()` — SQL queries for projects, entities, tags, sentiment breakdown
+- Two new MCP tools in server.ts:
+  - `gmail_enrich_emails` — Finds unenriched indexed emails, calls Haiku with 200ms delays, fetches full body from Gmail if body_preview < 200 chars
+  - `gmail_enrich_stats` — Returns enrichment statistics
+
+### Files created/modified
+- Created: src/enrichment.ts
+- Modified: src/server.ts (added enrichment tools + import)
+
+---
+
+## Sprint 2: Entity-Aware Search
+
 Status: IN PROGRESS

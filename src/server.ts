@@ -25,6 +25,7 @@ import {
   findSimilar,
   getIndexStats,
 } from "./vector-store.js";
+import { enrichEmail, getEnrichmentStats } from "./enrichment.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -488,6 +489,133 @@ function createServer(): McpServer {
       try {
         const email = getEmailFromExtra(extra);
         const stats = await getIndexStats(email);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ account: email, ...stats }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Enrichment Tools ───
+
+  server.tool(
+    "gmail_enrich_emails",
+    "Enrich indexed emails with AI-extracted metadata: intent summary, life projects, entities, topics, sentiment. Uses Claude Haiku for extraction.",
+    {
+      max_results: z
+        .number()
+        .min(1)
+        .max(200)
+        .default(50)
+        .describe("Maximum number of unenriched emails to process"),
+      query: z
+        .string()
+        .optional()
+        .describe("Optional Gmail search query to filter which indexed emails to enrich"),
+    },
+    async ({ max_results, query }, extra) => {
+      try {
+        const { gmail, email } = await getGmailFromExtra(extra);
+
+        // Find unenriched emails
+        let sql = `
+          SELECT e.id, e.subject, e.from_addr, e.to_addr, e.date, e.body_preview
+          FROM emails e
+          LEFT JOIN email_enrichment ee ON ee.email_id = e.id
+          WHERE e.user_email = $1 AND ee.email_id IS NULL`;
+        const params: any[] = [email];
+
+        if (query) {
+          sql += ` AND (e.subject ILIKE $2 OR e.snippet ILIKE $2)`;
+          params.push(`%${query}%`);
+        }
+
+        sql += ` ORDER BY e.indexed_at DESC LIMIT $${params.length + 1}`;
+        params.push(max_results);
+
+        const unenriched = await db.query(sql, params);
+
+        let enriched = 0;
+        let errors = 0;
+
+        for (const row of unenriched.rows) {
+          // If body_preview is short, try to get full body from Gmail
+          let body = row.body_preview || "";
+          if (body.length < 200) {
+            try {
+              const fullEmail = await getEmail(gmail, row.id);
+              body = fullEmail.body || body;
+            } catch {
+              // Use what we have
+            }
+          }
+
+          const result = await enrichEmail(
+            row.id,
+            row.subject || "",
+            row.from_addr || "",
+            row.to_addr || "",
+            row.date || "",
+            body
+          );
+
+          if (result) {
+            enriched++;
+          } else {
+            errors++;
+          }
+
+          // 200ms delay between Haiku calls
+          if (unenriched.rows.indexOf(row) < unenriched.rows.length - 1) {
+            await new Promise((r) => setTimeout(r, 200));
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  message: `Enriched ${enriched} emails, ${errors} errors, ${unenriched.rows.length - enriched - errors} skipped`,
+                  enriched,
+                  errors,
+                  total_candidates: unenriched.rows.length,
+                  account: email,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error enriching: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_enrich_stats",
+    "Get enrichment statistics: total/enriched emails, projects, entities, tags, sentiment breakdown.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const stats = await getEnrichmentStats(email);
         return {
           content: [
             {
