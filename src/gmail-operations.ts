@@ -101,11 +101,10 @@ export async function sendEmail(
     lines.push(`References: ${inReplyTo}`);
   }
   lines.push("Content-Type: text/plain; charset=utf-8");
-  lines.push("Content-Transfer-Encoding: base64");
   lines.push("");
-  lines.push(Buffer.from(body, "utf-8").toString("base64"));
+  lines.push(body);
 
-  const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
+  const raw = Buffer.from(lines.join("\r\n"), "utf-8").toString("base64url");
 
   const res = await gmail.users.messages.send({
     userId: "me",
@@ -148,11 +147,10 @@ export async function createDraft(
     lines.push(`References: ${inReplyTo}`);
   }
   lines.push("Content-Type: text/plain; charset=utf-8");
-  lines.push("Content-Transfer-Encoding: base64");
   lines.push("");
-  lines.push(Buffer.from(body, "utf-8").toString("base64"));
+  lines.push(body);
 
-  const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
+  const raw = Buffer.from(lines.join("\r\n"), "utf-8").toString("base64url");
 
   const res = await gmail.users.drafts.create({
     userId: "me",
