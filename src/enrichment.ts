@@ -28,12 +28,37 @@ Respond ONLY in JSON. No markdown, no preamble, no backticks.
 }
 
 Rules:
+- Do NOT include the email account owner (Henry Williams / digitalhen@gmail.com) as an entity. Only extract OTHER people, organizations, and places.
 - For flight bookings, extract: airline, flight number, origin, destination, dates, all passenger names
 - For appointment emails, extract: provider, patient/client, date, type of appointment
 - For co-parenting emails, always extract: children mentioned, dates discussed, locations
 - Use CONSISTENT project names across emails (don't create variants like 'UK Trip' and 'London Trip')
 - Promotional/marketing emails: set life_project to null, email_type to "promotional"
-- Be specific with intent_summary: "Booking family flight to London" not "Travel email"`;
+- Be specific with intent_summary: "Booking family flight to London" not "Travel email"
+- Notifications from service providers about ONGOING life matters (vet reminders, medical portal messages, school updates) ARE projects, not just transactional
+
+EXAMPLES:
+
+Email: From ConEdison, subject "Your bill is due", amount $266.56
+→ life_project: null (routine bill, not a project)
+
+Email: From Bensonhurst Vet Care, subject "Patient Reminder - Snowball due for FVRCP"
+→ life_project: "Snowball Vet Care" (ongoing pet health management)
+
+Email: From donotreply@myconnectnyc.org, subject "New Connect message for Tristan from CUIMC/NYP/WCM"
+→ life_project: "Tristan Medical Care" (child's medical care coordination)
+
+Email: From LinkedIn, subject "You may be a fit for Anthropic's Product Manager role"
+→ life_project: "Job Search" (active job search)
+
+Email: From JetBlue, subject "Booking confirmation JFK to LHR"
+→ life_project: "London Trip March 2026" (family travel planning)
+
+Email: From Target, subject "Your order has shipped"
+→ life_project: null (routine purchase)
+
+Email: From rosanna.mah@gmail.com, subject "Re: Travel" about coordinating Tristan's schedule
+→ life_project: "London Trip March 2026" (trip logistics involving co-parenting coordination)`;
 
 interface EnrichmentResult {
   intent_summary: string;
@@ -53,12 +78,59 @@ interface EnrichmentResult {
 }
 
 function parseEnrichmentResponse(text: string): EnrichmentResult {
-  // Strip markdown fences if present
   let cleaned = text.trim();
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
   }
   return JSON.parse(cleaned);
+}
+
+// ─── Entity canonicalization ───
+
+const ENTITY_MERGES: Record<string, string> = {
+  "amazon.com": "amazon",
+  "amazon prime": "amazon",
+  "amazon.com inc": "amazon",
+  "new york city": "new york",
+  "new york, ny": "new york",
+  "nyc": "new york",
+  "ny": "new york",
+  "brooklyn, ny": "brooklyn",
+  "brooklyn, new york": "brooklyn",
+};
+
+// Owner name variants to filter out
+const OWNER_NAMES = new Set([
+  "henry williams",
+  "henry",
+  "digitalhen",
+  "digitalhen@gmail.com",
+]);
+
+function canonicalizeEntity(name: string, _type: string): string {
+  let canonical = name.toLowerCase().trim();
+  return ENTITY_MERGES[canonical] || canonical;
+}
+
+function isOwnerEntity(name: string): boolean {
+  return OWNER_NAMES.has(name.toLowerCase().trim());
+}
+
+// ─── HTML stripping ───
+
+export function stripHtml(html: string): string {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#\d+;/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export async function enrichEmail(
@@ -70,12 +142,15 @@ export async function enrichEmail(
   body: string
 ): Promise<EnrichmentResult | null> {
   try {
+    // Strip HTML from body before sending to Haiku
+    const cleanBody = stripHtml(body);
+
     const emailText = `From: ${from}
 To: ${to}
 Date: ${date}
 Subject: ${subject}
 
-${body}`;
+${cleanBody.slice(0, 3000)}`;
 
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
@@ -92,12 +167,16 @@ ${body}`;
       message.content[0].type === "text" ? message.content[0].text : "";
     const enrichment = parseEnrichmentResponse(responseText);
 
-    // Write to Postgres in a transaction
+    // Filter out owner entity
+    const filteredEntities = (enrichment.entities || []).filter(
+      (e) => !isOwnerEntity(e.name)
+    );
+
     await db.transaction(async (client) => {
-      // 1. Insert email_enrichment
+      // 1. Insert email_enrichment with raw response
       await client.query(
-        `INSERT INTO email_enrichment (email_id, intent_summary, life_project, sentiment, email_type, is_transactional, is_promotional, enrichment_model)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO email_enrichment (email_id, intent_summary, life_project, sentiment, email_type, is_transactional, is_promotional, enrichment_model, enrichment_raw)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (email_id) DO UPDATE SET
            intent_summary = EXCLUDED.intent_summary,
            life_project = EXCLUDED.life_project,
@@ -106,6 +185,7 @@ ${body}`;
            is_transactional = EXCLUDED.is_transactional,
            is_promotional = EXCLUDED.is_promotional,
            enrichment_model = EXCLUDED.enrichment_model,
+           enrichment_raw = EXCLUDED.enrichment_raw,
            enriched_at = NOW()`,
         [
           emailId,
@@ -116,14 +196,22 @@ ${body}`;
           enrichment.email_type === "transactional",
           enrichment.email_type === "promotional",
           "claude-haiku-4-5-20251001",
+          JSON.stringify(enrichment),
         ]
       );
 
-      // 2. Insert entities and link to email
-      for (const entity of enrichment.entities || []) {
-        const canonicalName = entity.name.toLowerCase().trim();
+      // 2. If promotional, flag in emails table
+      if (enrichment.email_type === "promotional") {
+        await client.query(
+          "UPDATE emails SET is_promotional = true WHERE id = $1",
+          [emailId]
+        );
+      }
 
-        // Upsert entity
+      // 3. Insert entities (with canonicalization, owner filtering)
+      for (const entity of filteredEntities) {
+        const canonicalName = canonicalizeEntity(entity.name, entity.type);
+
         const entityResult = await client.query(
           `INSERT INTO entities (name, entity_type, canonical_name)
            VALUES ($1, $2, $3)
@@ -134,7 +222,6 @@ ${body}`;
 
         const entityId = entityResult.rows[0].id;
 
-        // Link entity to email
         await client.query(
           `INSERT INTO email_entities (email_id, entity_id, role)
            VALUES ($1, $2, $3)
@@ -143,7 +230,7 @@ ${body}`;
         );
       }
 
-      // 3. Insert tags
+      // 4. Insert tags
       for (const tag of enrichment.topics || []) {
         await client.query(
           `INSERT INTO email_tags (email_id, tag)
@@ -153,7 +240,19 @@ ${body}`;
         );
       }
 
-      // 4. Insert/update project if present
+      // 5. Insert key_dates
+      for (const kd of enrichment.key_dates || []) {
+        if (kd.date) {
+          await client.query(
+            `INSERT INTO email_dates (email_id, date, description)
+             VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING`,
+            [emailId, kd.date, kd.description]
+          );
+        }
+      }
+
+      // 6. Insert/update project if present
       if (enrichment.life_project) {
         const projectResult = await client.query(
           `INSERT INTO projects (name, first_seen, last_activity)

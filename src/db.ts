@@ -223,6 +223,18 @@ class Database {
         new_value TEXT,
         corrected_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS email_dates (
+        email_id TEXT REFERENCES emails(id),
+        date TEXT NOT NULL,
+        description TEXT,
+        PRIMARY KEY (email_id, date)
+      );
+
+      -- New columns (idempotent with DO NOTHING on error)
+      ALTER TABLE emails ADD COLUMN IF NOT EXISTS body_full TEXT;
+      ALTER TABLE email_enrichment ADD COLUMN IF NOT EXISTS enrichment_raw JSONB;
+      ALTER TABLE emails ADD COLUMN IF NOT EXISTS is_promotional BOOLEAN DEFAULT FALSE;
     `);
   }
 }

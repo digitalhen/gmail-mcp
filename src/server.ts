@@ -402,10 +402,14 @@ function createServer(): McpServer {
       try {
         const { gmail, email } = await getGmailFromExtra(extra);
         // Default to last 12 months
-        const twelveMonthsAgo = new Date();
-        twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-        const dateFilter = `after:${twelveMonthsAgo.getFullYear()}/${String(twelveMonthsAgo.getMonth() + 1).padStart(2, "0")}/${String(twelveMonthsAgo.getDate()).padStart(2, "0")}`;
-        const fullQuery = query ? `${dateFilter} ${query}` : dateFilter;
+        // Skip default date filter if user already provided after: in query
+        let fullQuery = query || "";
+        if (!fullQuery.includes("after:")) {
+          const twelveMonthsAgo = new Date();
+          twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+          const dateFilter = `after:${twelveMonthsAgo.getFullYear()}/${String(twelveMonthsAgo.getMonth() + 1).padStart(2, "0")}/${String(twelveMonthsAgo.getDate()).padStart(2, "0")}`;
+          fullQuery = fullQuery ? `${dateFilter} ${fullQuery}` : dateFilter;
+        }
 
         if (index_all) {
           const result = await indexAllEmails({
@@ -646,9 +650,9 @@ function createServer(): McpServer {
             errors++;
           }
 
-          // 200ms delay between Haiku calls
+          // 50ms delay between Haiku calls
           if (unenriched.rows.indexOf(row) < unenriched.rows.length - 1) {
-            await new Promise((r) => setTimeout(r, 200));
+            await new Promise((r) => setTimeout(r, 50));
           }
         }
 
@@ -802,7 +806,36 @@ function createServer(): McpServer {
           scores[id].reasons.push(reason);
         }
 
-        // 1. Project search (weight: 0.4)
+        // Diagnostics for debugging
+        const diagnostics: any = {
+          project_matches: 0,
+          entity_matches: 0,
+          vector_matches: 0,
+          seed_has_enrichment: false,
+          seed_projects: [] as string[],
+          seed_entity_count: 0,
+        };
+
+        // Check seed email enrichment status
+        const seedEnrichment = await db.query(
+          "SELECT 1 FROM email_enrichment WHERE email_id = $1",
+          [message_id]
+        );
+        diagnostics.seed_has_enrichment = seedEnrichment.rows.length > 0;
+
+        const seedProjects = await db.query(
+          `SELECT p.name FROM email_projects ep JOIN projects p ON p.id = ep.project_id WHERE ep.email_id = $1`,
+          [message_id]
+        );
+        diagnostics.seed_projects = seedProjects.rows.map((r: any) => r.name);
+
+        const seedEntities = await db.query(
+          "SELECT COUNT(*) as count FROM email_entities WHERE email_id = $1",
+          [message_id]
+        );
+        diagnostics.seed_entity_count = parseInt(seedEntities.rows[0].count);
+
+        // 1. Project search (weight: 1.0 — binary, strongest signal)
         const projectEmails = await db.query(
           `SELECT DISTINCT ep2.email_id, p.name as project_name
            FROM email_projects ep1
@@ -811,11 +844,12 @@ function createServer(): McpServer {
            WHERE ep1.email_id = $1 AND ep2.email_id != $1`,
           [message_id]
         );
+        diagnostics.project_matches = projectEmails.rows.length;
         for (const row of projectEmails.rows) {
-          addScore(row.email_id, 0.4, `project: ${row.project_name}`);
+          addScore(row.email_id, 1.0, `project: ${row.project_name}`);
         }
 
-        // 2. Entity search (weight: 0.35)
+        // 2. Entity search (weight: 0.5, scaled by shared count)
         const entityEmails = await db.query(
           `SELECT ee2.email_id, COUNT(DISTINCT ee2.entity_id) as shared_count,
                   array_agg(DISTINCT en.name) as entity_names
@@ -828,20 +862,26 @@ function createServer(): McpServer {
            ORDER BY shared_count DESC`,
           [message_id]
         );
+        diagnostics.entity_matches = entityEmails.rows.length;
+        // Normalize entity scores against max
+        const maxShared = entityEmails.rows.length > 0
+          ? Math.max(...entityEmails.rows.map((r: any) => parseInt(r.shared_count)))
+          : 1;
         for (const row of entityEmails.rows) {
-          const entityScore = Math.min(row.shared_count * 0.175, 0.35);
+          const normalized = parseInt(row.shared_count) / maxShared;
           addScore(
             row.email_id,
-            entityScore,
-            `entities: ${row.entity_names.slice(0, 3).join(", ")}`
+            normalized * 0.5,
+            `entities(${row.shared_count}): ${row.entity_names.slice(0, 3).join(", ")}`
           );
         }
 
-        // 3. Vector search (weight: 0.25)
+        // 3. Vector search (weight: 0.3)
         try {
           const vectorResults = await findSimilar(message_id, email, 20);
+          diagnostics.vector_matches = vectorResults.length;
           for (const r of vectorResults) {
-            addScore(r.id, r.similarity * 0.25, `vector: ${r.similarity.toFixed(3)}`);
+            addScore(r.id, r.similarity * 0.3, `vector: ${r.similarity.toFixed(3)}`);
           }
         } catch {
           // Vector search may fail if email not indexed — that's OK
@@ -854,7 +894,7 @@ function createServer(): McpServer {
 
         if (sorted.length === 0) {
           return {
-            content: [{ type: "text", text: "No related emails found." }],
+            content: [{ type: "text", text: JSON.stringify({ diagnostics, results: [] }, null, 2) }],
           };
         }
 
@@ -883,7 +923,7 @@ function createServer(): McpServer {
 
         return {
           content: [
-            { type: "text", text: JSON.stringify(results, null, 2) },
+            { type: "text", text: JSON.stringify({ diagnostics, results }, null, 2) },
           ],
         };
       } catch (error: any) {
@@ -914,6 +954,30 @@ function createServer(): McpServer {
 
         let currentIds = [message_id];
         const seenIds = new Set([message_id]);
+
+        // Check if seed has entities; if not, try to enrich it on-the-fly
+        const seedEntityCheck = await db.query(
+          "SELECT COUNT(*) as count FROM email_entities WHERE email_id = $1",
+          [message_id]
+        );
+        if (parseInt(seedEntityCheck.rows[0].count) === 0) {
+          // Try to enrich the seed email
+          const seedEmail = await db.query(
+            "SELECT subject, from_addr, to_addr, date, body_preview, body_full FROM emails WHERE id = $1",
+            [message_id]
+          );
+          if (seedEmail.rows.length > 0) {
+            const s = seedEmail.rows[0];
+            await enrichEmail(
+              message_id,
+              s.subject || "",
+              s.from_addr || "",
+              s.to_addr || "",
+              s.date || "",
+              s.body_full || s.body_preview || ""
+            );
+          }
+        }
 
         for (let hop = 1; hop <= hops; hop++) {
           if (currentIds.length === 0) break;
@@ -1232,6 +1296,148 @@ function createServer(): McpServer {
             {
               type: "text",
               text: JSON.stringify({ account: email, ...report }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Cleanup Tools ───
+
+  server.tool(
+    "gmail_cleanup_promotionals",
+    "Clean up already-enriched promotional emails: remove from projects, remove their entities from the graph, flag them in the emails table.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        // Find promotional emails for this user
+        const promos = await db.query(
+          `SELECT e.id FROM emails e
+           JOIN email_enrichment ee ON ee.email_id = e.id
+           WHERE e.user_email = $1 AND (ee.is_promotional = true OR ee.email_type = 'promotional')`,
+          [email]
+        );
+
+        let cleaned = 0;
+        for (const row of promos.rows) {
+          await db.query("DELETE FROM email_projects WHERE email_id = $1", [row.id]);
+          await db.query("DELETE FROM email_entities WHERE email_id = $1", [row.id]);
+          await db.query("UPDATE emails SET is_promotional = true WHERE id = $1", [row.id]);
+          cleaned++;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ cleaned, account: email }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_consolidate_entities",
+    "Use AI to merge duplicate entity names (e.g., 'Amazon.com' and 'Amazon'). Sends top entities to Haiku for merge suggestions.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        const entities = await db.query(
+          `SELECT en.id, en.name, en.entity_type, en.canonical_name, COUNT(ee.email_id) as email_count
+           FROM entities en
+           JOIN email_entities ee ON ee.entity_id = en.id
+           JOIN emails e ON e.id = ee.email_id
+           WHERE e.user_email = $1
+           GROUP BY en.id
+           ORDER BY email_count DESC
+           LIMIT 100`,
+          [email]
+        );
+
+        if (entities.rows.length < 2) {
+          return { content: [{ type: "text", text: "Not enough entities to consolidate." }] };
+        }
+
+        const entityList = entities.rows
+          .map((e: any) => `- "${e.name}" (${e.entity_type}, ${e.email_count} emails)`)
+          .join("\n");
+
+        const anthropic = new (await import("@anthropic-ai/sdk")).default();
+        const message = await anthropic.messages.create({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          messages: [
+            {
+              role: "user",
+              content: `Merge duplicate entities in a personal email knowledge graph. Only merge if they clearly refer to the same entity.
+
+Entities:
+${entityList}
+
+Respond ONLY in JSON, no backticks:
+{"merges": [{"from_ids": [1, 2], "to_name": "canonical name", "to_type": "type"}]}
+
+If no merges needed, return {"merges": []}`,
+            },
+          ],
+        });
+
+        const responseText = message.content[0].type === "text" ? message.content[0].text : "{}";
+        let cleaned = responseText.trim();
+        if (cleaned.startsWith("```")) {
+          cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+        }
+        const result = JSON.parse(cleaned);
+
+        let merged = 0;
+        for (const merge of result.merges || []) {
+          if (!merge.from_ids || merge.from_ids.length < 2) continue;
+
+          const keepId = merge.from_ids[0];
+          const mergeIds = merge.from_ids.slice(1);
+
+          // Update canonical name on kept entity
+          await db.query(
+            "UPDATE entities SET name = $1, canonical_name = $2 WHERE id = $3",
+            [merge.to_name, merge.to_name.toLowerCase().trim(), keepId]
+          );
+
+          // Move email_entities links
+          for (const fromId of mergeIds) {
+            await db.query(
+              `UPDATE email_entities SET entity_id = $1
+               WHERE entity_id = $2
+               AND (email_id, $1, role) NOT IN (SELECT email_id, entity_id, role FROM email_entities WHERE entity_id = $1)`,
+              [keepId, fromId]
+            );
+            await db.query("DELETE FROM email_entities WHERE entity_id = $1", [fromId]);
+            await db.query("DELETE FROM entities WHERE id = $1", [fromId]);
+          }
+          merged += mergeIds.length;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ merged, merges: result.merges || [], account: email }, null, 2),
             },
           ],
         };

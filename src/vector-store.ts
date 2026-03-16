@@ -1,5 +1,6 @@
 import { db } from "./db.js";
 import { createHash } from "crypto";
+import { stripHtml } from "./enrichment.js";
 
 let pipelineFn: any;
 let embeddingPipeline: any;
@@ -46,6 +47,7 @@ export async function indexEmail(record: {
   date: string;
   snippet: string;
   bodyPreview: string;
+  bodyFull: string;
   bodyHash: string;
 }): Promise<boolean> {
   // Check dedup by id
@@ -63,16 +65,16 @@ export async function indexEmail(record: {
     if (hashExists.rows.length > 0) return false;
   }
 
-  // Generate embedding
-  const text = `${record.subject} ${record.snippet} ${record.bodyPreview?.slice(0, 1000) || ""}`;
+  // Strip HTML and generate embedding on clean text
+  const cleanBody = stripHtml(record.bodyPreview);
+  const text = `${record.subject} ${record.snippet} ${cleanBody.slice(0, 1000)}`;
   const embedding = await generateEmbedding(text);
 
-  // pgvector wants the vector as a string like '[0.1, 0.2, ...]'
   const vectorStr = `[${embedding.join(",")}]`;
 
   await db.query(
-    `INSERT INTO emails (id, user_email, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, body_hash, embedding)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `INSERT INTO emails (id, user_email, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, body_full, body_hash, embedding)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (id) DO NOTHING`,
     [
       record.id,
@@ -84,6 +86,7 @@ export async function indexEmail(record: {
       record.date,
       record.snippet,
       record.bodyPreview,
+      record.bodyFull,
       record.bodyHash,
       vectorStr,
     ]
@@ -119,7 +122,8 @@ export async function indexEmails(
       toAddr: email.to,
       date: email.date,
       snippet: email.snippet,
-      bodyPreview: email.body.substring(0, 500),
+      bodyPreview: email.body.substring(0, 2000),
+      bodyFull: email.body,
       bodyHash,
     });
 

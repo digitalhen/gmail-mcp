@@ -164,7 +164,8 @@ export async function indexAllEmails(
           toAddr: to,
           date,
           snippet,
-          bodyPreview: body.substring(0, 500),
+          bodyPreview: body.substring(0, 2000),
+          bodyFull: body,
           bodyHash,
         });
 
@@ -174,7 +175,7 @@ export async function indexAllEmails(
           // Auto-enrich if requested
           if (enrich) {
             await enrichEmail(msg.id!, subject, from, to, date, body);
-            await new Promise((r) => setTimeout(r, 200)); // Rate limit
+            await new Promise((r) => setTimeout(r, 50)); // Rate limit
           }
         } else {
           skipped++;
