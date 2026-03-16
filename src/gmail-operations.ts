@@ -71,6 +71,15 @@ function parseMessage(msg: gmail_v1.Schema$Message): EmailMessage {
   };
 }
 
+// RFC 2047 encode a header value if it contains non-ASCII characters
+function encodeHeaderValue(value: string): string {
+  // Check if the string contains non-ASCII characters
+  if (/^[\x20-\x7E]*$/.test(value)) return value;
+  // Encode as RFC 2047 Base64
+  const encoded = Buffer.from(value, "utf-8").toString("base64");
+  return `=?UTF-8?B?${encoded}?=`;
+}
+
 export async function sendEmail(
   gmail: gmail_v1.Gmail,
   to: string,
@@ -85,14 +94,16 @@ export async function sendEmail(
   lines.push(`To: ${to}`);
   if (cc) lines.push(`Cc: ${cc}`);
   if (bcc) lines.push(`Bcc: ${bcc}`);
-  lines.push(`Subject: ${subject}`);
+  lines.push(`Subject: ${encodeHeaderValue(subject)}`);
+  lines.push("MIME-Version: 1.0");
   if (inReplyTo) {
     lines.push(`In-Reply-To: ${inReplyTo}`);
     lines.push(`References: ${inReplyTo}`);
   }
   lines.push("Content-Type: text/plain; charset=utf-8");
+  lines.push("Content-Transfer-Encoding: base64");
   lines.push("");
-  lines.push(body);
+  lines.push(Buffer.from(body, "utf-8").toString("base64"));
 
   const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
 
@@ -125,14 +136,17 @@ export async function createDraft(
   lines.push(`To: ${to}`);
   if (cc) lines.push(`Cc: ${cc}`);
   if (bcc) lines.push(`Bcc: ${bcc}`);
-  lines.push(`Subject: ${subject}`);
+  lines.push(`Subject: ${encodeHeaderValue(subject)}`);
+  lines.push("MIME-Version: 1.0");
   if (inReplyTo) {
     lines.push(`In-Reply-To: ${inReplyTo}`);
     lines.push(`References: ${inReplyTo}`);
   }
   lines.push("Content-Type: text/plain; charset=utf-8");
+  lines.push("Content-Transfer-Encoding: base64");
   lines.push("");
-  lines.push(body);
+  // Base64-encode the body to avoid any charset issues
+  lines.push(Buffer.from(body, "utf-8").toString("base64"));
 
   const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
 
