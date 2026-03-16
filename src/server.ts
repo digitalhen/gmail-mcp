@@ -27,6 +27,13 @@ import {
   generateEmbedding,
 } from "./vector-store.js";
 import { enrichEmail, getEnrichmentStats } from "./enrichment.js";
+import {
+  consolidateProjects,
+  assignOrphans,
+  listProjects,
+  projectEmails,
+  projectSummary,
+} from "./projects.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -918,6 +925,137 @@ function createServer(): McpServer {
               ),
             },
           ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Sprint 3: Project Clustering Tools ───
+
+  server.tool(
+    "gmail_consolidate_projects",
+    "Use AI to merge duplicate/variant project names (e.g., 'UK Trip' and 'London Trip March 2026'). Sends project list to Haiku for merge suggestions, then applies them.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const result = await consolidateProjects(email);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { message: `Merged ${result.merged} project variants`, ...result },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_assign_orphans",
+    "Find enriched emails with no project assignment and try to assign them via entity overlap with existing projects.",
+    {
+      max_results: z.number().min(1).max(200).default(50).describe("Max orphan emails to process"),
+    },
+    async ({ max_results }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const result = await assignOrphans(email, max_results);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { message: `Assigned ${result.assigned} orphan emails, ${result.unassigned} remain unassigned`, ...result },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_list_projects",
+    "List all projects with email counts, date ranges, and status.",
+    {},
+    async (_, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const projects = await listProjects(email);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(projects, null, 2) },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_project_emails",
+    "Get all emails belonging to a specific project.",
+    {
+      project_name: z.string().describe("The project name"),
+      limit: z.number().min(1).max(100).default(30).describe("Maximum emails to return"),
+    },
+    async ({ project_name, limit }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const emails = await projectEmails(email, project_name, limit);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(emails, null, 2) },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_project_summary",
+    "Generate an AI narrative summary of a project: what it's about, who's involved, key dates, and current status.",
+    {
+      project_name: z.string().describe("The project name to summarize"),
+    },
+    async ({ project_name }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const summary = await projectSummary(email, project_name);
+        return {
+          content: [{ type: "text", text: summary }],
         };
       } catch (error: any) {
         return {

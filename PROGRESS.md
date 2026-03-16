@@ -103,4 +103,22 @@ Status: COMPLETE
 
 ## Sprint 3: Project Clustering
 
+Status: COMPLETE
+
+### What was built
+- `src/projects.ts` — Project management module:
+  - `consolidateProjects()` — Sends project list to Haiku for merge suggestions, applies merges in a transaction
+  - `applyProjectMerge()` — Moves email_projects links, deletes source projects
+  - `assignOrphans()` — Finds enriched emails with no project, assigns via entity overlap (2+ shared entities)
+  - `listProjects()` / `projectEmails()` / `projectSummary()` — Queries and Haiku-generated narrative
+- 5 new MCP tools: `gmail_consolidate_projects`, `gmail_assign_orphans`, `gmail_list_projects`, `gmail_project_emails`, `gmail_project_summary`
+
+### Files created/modified
+- Created: src/projects.ts
+- Modified: src/server.ts (5 new tools + import)
+
+---
+
+## Sprint 4: Self-Improvement + Corrections
+
 Status: IN PROGRESS
