@@ -87,4 +87,20 @@ Status: COMPLETE
 
 ## Sprint 2: Entity-Aware Search
 
+Status: COMPLETE
+
+### What was built
+- `gmail_reembed_enriched` — Re-embeds enriched emails with richer text (subject + from + intent + project + topics + entities + body). Updates the embedding column and sets embedding_enriched = true.
+- `gmail_find_related` — 3-way search combining project overlap (0.4 weight), entity overlap (0.35 weight, requires 2+ shared entities), and vector similarity (0.25 weight). Returns results with match_reasons explaining why each email matched.
+- `gmail_multi_hop` — Multi-hop entity traversal. Each hop finds emails sharing 2+ entities with previous results. Tracks seen IDs to avoid cycles. Returns grouped by hop with discovered entity chains.
+- Exported `generateEmbedding` from vector-store.ts for reuse in reembed tool.
+
+### Files modified
+- src/server.ts (3 new tools)
+- src/vector-store.ts (export generateEmbedding)
+
+---
+
+## Sprint 3: Project Clustering
+
 Status: IN PROGRESS

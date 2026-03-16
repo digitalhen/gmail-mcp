@@ -24,6 +24,7 @@ import {
   semanticSearch,
   findSimilar,
   getIndexStats,
+  generateEmbedding,
 } from "./vector-store.js";
 import { enrichEmail, getEnrichmentStats } from "./enrichment.js";
 
@@ -621,6 +622,300 @@ function createServer(): McpServer {
             {
               type: "text",
               text: JSON.stringify({ account: email, ...stats }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Sprint 2: Entity-Aware Search Tools ───
+
+  server.tool(
+    "gmail_reembed_enriched",
+    "Re-embed enriched emails with richer text that includes intent, project, topics, and entities. Improves semantic search quality.",
+    {
+      max_results: z.number().min(1).max(500).default(100).describe("Max emails to re-embed"),
+    },
+    async ({ max_results }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        const rows = await db.query(
+          `SELECT e.id, e.subject, e.from_addr, e.body_preview,
+                  ee.intent_summary, ee.life_project
+           FROM emails e
+           JOIN email_enrichment ee ON ee.email_id = e.id
+           WHERE e.user_email = $1 AND ee.embedding_enriched = false
+           LIMIT $2`,
+          [email, max_results]
+        );
+
+        let reembedded = 0;
+        for (const row of rows.rows) {
+          // Get tags and entities for this email
+          const tags = await db.query(
+            "SELECT tag FROM email_tags WHERE email_id = $1",
+            [row.id]
+          );
+          const entities = await db.query(
+            `SELECT en.name FROM entities en
+             JOIN email_entities ee ON ee.entity_id = en.id
+             WHERE ee.email_id = $1`,
+            [row.id]
+          );
+
+          const enrichedText = [
+            `Subject: ${row.subject || ""}`,
+            `From: ${row.from_addr || ""}`,
+            `Intent: ${row.intent_summary || ""}`,
+            `Project: ${row.life_project || "none"}`,
+            `Topics: ${tags.rows.map((t: any) => t.tag).join(", ") || "none"}`,
+            `Entities: ${entities.rows.map((e: any) => e.name).join(", ") || "none"}`,
+            `Body: ${(row.body_preview || "").slice(0, 1000)}`,
+          ].join("\n");
+
+          const embedding = await generateEmbedding(enrichedText);
+          const vectorStr = `[${embedding.join(",")}]`;
+
+          await db.query(
+            "UPDATE emails SET embedding = $1::vector WHERE id = $2",
+            [vectorStr, row.id]
+          );
+          await db.query(
+            "UPDATE email_enrichment SET embedding_enriched = true WHERE email_id = $1",
+            [row.id]
+          );
+          reembedded++;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ reembedded, account: email }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_find_related",
+    "Find related emails using a 3-way search: project overlap, shared entities, and vector similarity. Returns results with match reasons.",
+    {
+      message_id: z.string().describe("The message ID to find related emails for"),
+      limit: z.number().min(1).max(50).default(15).describe("Maximum results"),
+    },
+    async ({ message_id, limit }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        // Score maps: emailId → { score, reasons }
+        const scores: Record<string, { score: number; reasons: string[] }> = {};
+
+        function addScore(id: string, score: number, reason: string) {
+          if (id === message_id) return;
+          if (!scores[id]) scores[id] = { score: 0, reasons: [] };
+          scores[id].score += score;
+          scores[id].reasons.push(reason);
+        }
+
+        // 1. Project search (weight: 0.4)
+        const projectEmails = await db.query(
+          `SELECT DISTINCT ep2.email_id, p.name as project_name
+           FROM email_projects ep1
+           JOIN email_projects ep2 ON ep2.project_id = ep1.project_id
+           JOIN projects p ON p.id = ep1.project_id
+           WHERE ep1.email_id = $1 AND ep2.email_id != $1`,
+          [message_id]
+        );
+        for (const row of projectEmails.rows) {
+          addScore(row.email_id, 0.4, `project: ${row.project_name}`);
+        }
+
+        // 2. Entity search (weight: 0.35)
+        const entityEmails = await db.query(
+          `SELECT ee2.email_id, COUNT(DISTINCT ee2.entity_id) as shared_count,
+                  array_agg(DISTINCT en.name) as entity_names
+           FROM email_entities ee1
+           JOIN email_entities ee2 ON ee2.entity_id = ee1.entity_id
+           JOIN entities en ON en.id = ee1.entity_id
+           WHERE ee1.email_id = $1 AND ee2.email_id != $1
+           GROUP BY ee2.email_id
+           HAVING COUNT(DISTINCT ee2.entity_id) >= 2
+           ORDER BY shared_count DESC`,
+          [message_id]
+        );
+        for (const row of entityEmails.rows) {
+          const entityScore = Math.min(row.shared_count * 0.175, 0.35);
+          addScore(
+            row.email_id,
+            entityScore,
+            `entities: ${row.entity_names.slice(0, 3).join(", ")}`
+          );
+        }
+
+        // 3. Vector search (weight: 0.25)
+        try {
+          const vectorResults = await findSimilar(message_id, email, 20);
+          for (const r of vectorResults) {
+            addScore(r.id, r.similarity * 0.25, `vector: ${r.similarity.toFixed(3)}`);
+          }
+        } catch {
+          // Vector search may fail if email not indexed — that's OK
+        }
+
+        // Sort by combined score, fetch metadata
+        const sorted = Object.entries(scores)
+          .sort(([, a], [, b]) => b.score - a.score)
+          .slice(0, limit);
+
+        if (sorted.length === 0) {
+          return {
+            content: [{ type: "text", text: "No related emails found." }],
+          };
+        }
+
+        const ids = sorted.map(([id]) => id);
+        const metadata = await db.query(
+          `SELECT id, subject, from_addr, to_addr, date, snippet
+           FROM emails WHERE id = ANY($1)`,
+          [ids]
+        );
+
+        const metaMap = new Map(metadata.rows.map((r: any) => [r.id, r]));
+
+        const results = sorted.map(([id, { score, reasons }]) => {
+          const meta = metaMap.get(id) || {};
+          return {
+            id,
+            subject: meta.subject,
+            from: meta.from_addr,
+            to: meta.to_addr,
+            date: meta.date,
+            snippet: meta.snippet,
+            score: Math.round(score * 1000) / 1000,
+            match_reasons: reasons,
+          };
+        });
+
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(results, null, 2) },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_multi_hop",
+    "Hop through entity connections to discover indirect relationships between emails. Each hop finds emails sharing 2+ entities with the previous hop's results.",
+    {
+      message_id: z.string().describe("The starting message ID"),
+      hops: z.number().min(1).max(3).default(2).describe("Number of hops (1-3)"),
+      limit: z.number().min(1).max(50).default(20).describe("Maximum results per hop"),
+    },
+    async ({ message_id, hops, limit }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+        const allResults: Array<{
+          hop: number;
+          emails: any[];
+          entities_discovered: string[];
+        }> = [];
+
+        let currentIds = [message_id];
+        const seenIds = new Set([message_id]);
+
+        for (let hop = 1; hop <= hops; hop++) {
+          if (currentIds.length === 0) break;
+
+          // Find emails sharing 2+ entities with current set
+          const hopResults = await db.query(
+            `SELECT ee2.email_id, COUNT(DISTINCT ee2.entity_id) as shared_count,
+                    array_agg(DISTINCT en.name) as shared_entities
+             FROM email_entities ee1
+             JOIN email_entities ee2 ON ee2.entity_id = ee1.entity_id
+             JOIN entities en ON en.id = ee2.entity_id
+             JOIN emails e ON e.id = ee2.email_id
+             WHERE ee1.email_id = ANY($1)
+               AND ee2.email_id != ALL($1)
+               AND e.user_email = $2
+               AND ee2.email_id != ALL($3)
+             GROUP BY ee2.email_id
+             HAVING COUNT(DISTINCT ee2.entity_id) >= 2
+             ORDER BY shared_count DESC
+             LIMIT $4`,
+            [currentIds, email, Array.from(seenIds), limit]
+          );
+
+          const hopIds = hopResults.rows.map((r: any) => r.email_id);
+          if (hopIds.length === 0) break;
+
+          // Fetch metadata
+          const metadata = await db.query(
+            `SELECT id, subject, from_addr, date, snippet FROM emails WHERE id = ANY($1)`,
+            [hopIds]
+          );
+          const metaMap = new Map(metadata.rows.map((r: any) => [r.id, r]));
+
+          // Collect new entities discovered in this hop
+          const newEntities = new Set<string>();
+          for (const row of hopResults.rows) {
+            for (const name of row.shared_entities || []) {
+              newEntities.add(name);
+            }
+          }
+
+          allResults.push({
+            hop,
+            emails: hopResults.rows.map((r: any) => {
+              const meta = metaMap.get(r.email_id) || {};
+              return {
+                id: r.email_id,
+                subject: meta.subject,
+                from: meta.from_addr,
+                date: meta.date,
+                snippet: meta.snippet,
+                shared_entities: r.shared_entities,
+                shared_count: parseInt(r.shared_count),
+              };
+            }),
+            entities_discovered: Array.from(newEntities),
+          });
+
+          // Prepare for next hop
+          for (const id of hopIds) seenIds.add(id);
+          currentIds = hopIds;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { starting_email: message_id, hops: allResults },
+                null,
+                2
+              ),
             },
           ],
         };
