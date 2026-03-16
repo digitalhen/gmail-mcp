@@ -139,4 +139,36 @@ Status: COMPLETE
 
 ## Sprint 5: Indexing Improvements
 
-Status: IN PROGRESS
+Status: COMPLETE
+
+### What was built
+- `src/indexing.ts` — Paginated indexing module:
+  - `indexAllEmails()` — Paginates through Gmail API using `pageToken`, supports progress callbacks
+  - Promotional filtering via sender patterns (noreply@, newsletter@, etc.) and List-Unsubscribe header
+  - Smart dedup: checks by message ID first (skips API call), then by body hash
+  - Auto-enrich: optionally calls `enrichEmail()` after each index with 200ms rate limiting
+- Updated `gmail_index_emails` tool with new params: `index_all`, `enrich`, `skip_promotional`
+- `railway.toml` for Railway deployment
+- HNSW index auto-created after indexing batches
+
+### Files created/modified
+- Created: src/indexing.ts, railway.toml
+- Modified: src/server.ts (updated gmail_index_emails + import)
+
+---
+
+## Final Summary
+
+### Total MCP Tools: 31
+
+**Original (16):** gmail_whoami, send_email, get_recent_emails, get_email, get_thread, reply_to_email, search_emails, mark_as_read, mark_as_unread, trash_email, get_labels, gmail_index_emails, gmail_semantic_search, gmail_find_similar, gmail_index_stats
+
+**Sprint 1 (2):** gmail_enrich_emails, gmail_enrich_stats
+
+**Sprint 2 (3):** gmail_reembed_enriched, gmail_find_related, gmail_multi_hop
+
+**Sprint 3 (5):** gmail_consolidate_projects, gmail_assign_orphans, gmail_list_projects, gmail_project_emails, gmail_project_summary
+
+**Sprint 4 (5):** gmail_assign_project, gmail_merge_projects, gmail_rename_project, gmail_recluster, gmail_enrichment_review
+
+**Sprint 5:** Enhanced gmail_index_emails with pagination, auto-enrich, promo filter

@@ -41,6 +41,7 @@ import {
   recluster,
   enrichmentReview,
 } from "./corrections.js";
+import { indexAllEmails } from "./indexing.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -372,7 +373,7 @@ function createServer(): McpServer {
 
   server.tool(
     "gmail_index_emails",
-    "Index emails from the last 12 months into the vector database for semantic search. Run this to build up the searchable index. Fetches in batches and skips already-indexed emails.",
+    "Index emails from the last 12 months into the vector database for semantic search. Supports pagination through all matching emails, auto-enrichment, promotional filtering, and smart dedup.",
     {
       max_results: z
         .number()
@@ -384,8 +385,20 @@ function createServer(): McpServer {
         .string()
         .optional()
         .describe("Optional additional Gmail search query to filter which emails to index"),
+      index_all: z
+        .boolean()
+        .default(false)
+        .describe("When true, paginate through ALL matching emails instead of stopping at max_results"),
+      enrich: z
+        .boolean()
+        .default(false)
+        .describe("When true, auto-enrich each email with AI metadata after indexing"),
+      skip_promotional: z
+        .boolean()
+        .default(false)
+        .describe("When true, skip likely promotional/marketing emails"),
     },
-    async ({ max_results, query }, extra) => {
+    async ({ max_results, query, index_all, enrich, skip_promotional }, extra) => {
       try {
         const { gmail, email } = await getGmailFromExtra(extra);
         // Default to last 12 months
@@ -394,25 +407,68 @@ function createServer(): McpServer {
         const dateFilter = `after:${twelveMonthsAgo.getFullYear()}/${String(twelveMonthsAgo.getMonth() + 1).padStart(2, "0")}/${String(twelveMonthsAgo.getDate()).padStart(2, "0")}`;
         const fullQuery = query ? `${dateFilter} ${query}` : dateFilter;
 
-        const emails = await getRecentEmails(gmail, max_results, fullQuery);
-        const result = await indexEmails(email, emails);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  message: `Indexed ${result.indexed} emails, skipped ${result.skipped} already-indexed emails`,
-                  ...result,
-                  account: email,
-                  filter: fullQuery,
-                },
-                null,
-                2
-              ),
+        if (index_all) {
+          const result = await indexAllEmails({
+            gmail,
+            userEmail: email,
+            query: fullQuery,
+            batchSize: max_results,
+            skipPromotional: skip_promotional,
+            enrich,
+            onProgress: (indexed, skipped, total) => {
+              console.log(`[Indexing] Progress: ${indexed} indexed, ${skipped} skipped, ${total} processed`);
             },
-          ],
-        };
+          });
+
+          if (result.indexed > 0) {
+            await db.createHnswIndexIfNeeded();
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    message: `Indexed ${result.indexed} emails, skipped ${result.skipped}, ${result.promotional_skipped} promotional filtered, ${result.errors} errors`,
+                    ...result,
+                    account: email,
+                    filter: fullQuery,
+                    mode: "paginated",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } else {
+          const emails = await getRecentEmails(gmail, max_results, fullQuery);
+          const result = await indexEmails(email, emails);
+
+          if (result.indexed > 0) {
+            await db.createHnswIndexIfNeeded();
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    message: `Indexed ${result.indexed} emails, skipped ${result.skipped} already-indexed emails`,
+                    ...result,
+                    account: email,
+                    filter: fullQuery,
+                    mode: "batch",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
       } catch (error: any) {
         return {
           content: [{ type: "text", text: `Error indexing: ${error.message}` }],

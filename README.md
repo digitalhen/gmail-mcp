@@ -1,203 +1,192 @@
-# Gmail MCP Server
+# Gmail MCP Server — Knowledge Graph Edition
 
-A remote [Model Context Protocol](https://modelcontextprotocol.io) server that connects AI assistants to Gmail. Authenticate with Google, read and send emails, and search your inbox using natural language — all through claude.ai or any MCP-compatible client.
+A remote [Model Context Protocol](https://modelcontextprotocol.io) server that connects AI assistants to Gmail with a built-in knowledge graph. Authenticate with Google, read and send emails, search semantically, and explore relationships between emails through entities, projects, and topics.
 
-Includes a built-in vector database for semantic email search: find emails by meaning, not just keywords. Searching for "phone calls" will surface emails about FaceTime, Zoom, "give me a ring", etc.
+Built on PostgreSQL + pgvector for durable storage, Claude Haiku for AI enrichment, and local transformer embeddings for semantic search.
 
 ## Features
 
-- **OAuth integration** — Users authenticate with Google directly when adding the MCP server. No passwords stored, tokens auto-refresh.
-- **Multi-user** — Each user gets isolated Gmail access via their own OAuth tokens. Multiple people can use the same server.
+- **OAuth integration** — Users authenticate with Google when connecting the MCP server. Tokens persist in Postgres across restarts.
+- **Multi-user** — Each user gets isolated Gmail access via their own OAuth tokens.
 - **Full Gmail operations** — Send, read, reply, search, label, trash.
-- **Semantic search** — Local vector embeddings (all-MiniLM-L6-v2) index your emails for natural language search.
-- **Thread continuity** — Replies preserve Gmail thread context with proper `In-Reply-To` and `References` headers.
-- **Remote-first** — Runs as an HTTP server with Streamable HTTP transport, designed for claude.ai and remote MCP clients.
+- **Semantic search** — pgvector-backed embeddings (all-MiniLM-L6-v2, 384-dim) with HNSW indexing.
+- **AI enrichment** — Claude Haiku extracts intent, entities, projects, topics, sentiment from emails.
+- **Knowledge graph** — Entities, projects, and tags stored relationally. Multi-hop traversal across entity connections.
+- **Project clustering** — AI-driven project consolidation, orphan assignment, and lifecycle management.
+- **Self-improvement** — Manual corrections, reclustering, enrichment review.
+- **Dockerized** — `docker-compose up` brings up Postgres + app with zero manual steps.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  Docker Compose                                  │
+│                                                  │
+│  ┌──────────────┐    ┌────────────────────────┐ │
+│  │  MCP Server   │───▶│  PostgreSQL 16         │ │
+│  │  (Express 5)  │    │  + pgvector extension  │ │
+│  │  Port 3847    │    │                        │ │
+│  └──────────────┘    │  Tables:               │ │
+│                       │  - oauth_clients       │ │
+│                       │  - oauth_tokens        │ │
+│                       │  - emails              │ │
+│                       │  - email_enrichment    │ │
+│                       │  - entities            │ │
+│                       │  - email_entities      │ │
+│                       │  - projects            │ │
+│                       │  - email_projects      │ │
+│                       │  - email_tags          │ │
+│                       │  - corrections         │ │
+│                       └────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
 
 ## Setup
 
 ### 1. Google Cloud Project
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project (or select an existing one)
-3. Enable the **Gmail API**: APIs & Services → Library → search "Gmail API" → Enable
-4. Configure the **OAuth consent screen**: APIs & Services → OAuth consent screen
-   - Choose **External**
-   - App name: `Gmail MCP` (or whatever you like)
-   - Add your email as a test user
-   - Add scopes: `gmail.send`, `gmail.readonly`, `gmail.compose`, `gmail.modify`
-5. Create **OAuth credentials**: APIs & Services → Credentials → Create Credentials → OAuth client ID
-   - Application type: **Web application**
-   - Authorized redirect URIs: `http://localhost:3847/google/callback`
-   - If using ngrok/tunnel: also add `https://<your-domain>/google/callback`
-6. Download the credentials JSON
+2. Create a project, enable the **Gmail API**
+3. Configure OAuth consent screen (External, add test users)
+4. Create OAuth credentials: **Web application** type
+5. Add authorized redirect URI: `http://localhost:3847/google/callback` (and your public URL if deploying)
 
-### 2. Install and Configure
+### 2. Environment Variables
+
+Create `.env`:
+
+```env
+DATABASE_URL=postgresql://gmail_mcp:gmail_mcp@localhost:5433/gmail_mcp
+PORT=3847
+BASE_URL=http://localhost:3847
+GOOGLE_CLIENT_ID=your-client-id
+GOOGLE_CLIENT_SECRET=your-client-secret
+ANTHROPIC_API_KEY=your-anthropic-key
+```
+
+### 3. Run with Docker Compose
 
 ```bash
-git clone <repo-url> gmail-mcp
-cd gmail-mcp
+docker-compose up --build
+```
+
+This starts Postgres (with pgvector) and the MCP server. Migrations run automatically.
+
+### 4. Run in Development
+
+```bash
+docker-compose up db -d    # Start just Postgres
 npm install
+npm run dev                # Start server with tsx
 ```
-
-Place your Google credentials:
-
-```bash
-cp ~/Downloads/client_secret_*.json ~/.gmail-mcp/credentials.json
-```
-
-### 3. Run
-
-```bash
-# Development
-npm run dev
-
-# Production
-npm run build
-npm start
-```
-
-The server starts on port 3847 by default.
-
-### 4. Expose Publicly (for claude.ai)
-
-The server needs to be reachable over HTTPS for claude.ai. Use ngrok or any reverse proxy:
-
-```bash
-ngrok http 3847
-```
-
-Then set `BASE_URL` to the public URL:
-
-```bash
-BASE_URL=https://your-domain.ngrok-free.app npm run dev
-```
-
-**Important:** Add `https://your-domain.ngrok-free.app/google/callback` as an authorized redirect URI in your Google Cloud Console credentials.
 
 ### 5. Connect to claude.ai
 
-1. Go to claude.ai → Settings → MCP Servers → Add
-2. Enter your MCP endpoint: `https://your-domain.ngrok-free.app/mcp`
-3. Claude.ai will discover the OAuth configuration, redirect you to Google sign-in, and connect automatically
+For remote access, expose via ngrok:
 
-## Environment Variables
+```bash
+ngrok http 3847
+BASE_URL=https://your-ngrok-url npm run dev
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3847` | Server port |
-| `BASE_URL` | `http://localhost:3847` | Public URL of the server (must match what clients use) |
+Add `https://your-ngrok-url/google/callback` as an authorized redirect URI in Google Cloud Console, then add `https://your-ngrok-url/mcp` as an MCP server in claude.ai.
 
-## MCP Tools
+## MCP Tools (31 total)
 
 ### Account
-
 | Tool | Description |
 |------|-------------|
-| `gmail_whoami` | Check which Gmail account is authenticated |
+| `gmail_whoami` | Check authenticated Gmail account |
 
 ### Email Operations
-
 | Tool | Description |
 |------|-------------|
-| `send_email` | Send a new email (to, subject, body, cc, bcc) |
-| `get_recent_emails` | Fetch inbox with optional search query and unread filter |
-| `get_email` | Get full email details by message ID |
+| `send_email` | Send email (to, subject, body, cc, bcc) |
+| `get_recent_emails` | Fetch inbox with search query and unread filter |
+| `get_email` | Get full email by message ID |
 | `get_thread` | Get all messages in a thread |
-| `reply_to_email` | Reply to an email, preserving the thread |
-| `search_emails` | Search using Gmail query syntax (`from:`, `has:attachment`, etc.) |
-| `mark_as_read` | Mark a message as read |
-| `mark_as_unread` | Mark a message as unread |
-| `trash_email` | Move a message to trash |
-| `get_labels` | List all Gmail labels |
+| `reply_to_email` | Reply preserving thread context |
+| `search_emails` | Gmail query syntax search |
+| `mark_as_read` / `mark_as_unread` | Toggle read status |
+| `trash_email` | Move to trash |
+| `get_labels` | List Gmail labels |
 
-### Semantic Search
-
+### Indexing & Semantic Search
 | Tool | Description |
 |------|-------------|
-| `gmail_index_emails` | Index recent emails into the vector database |
-| `gmail_semantic_search` | Search emails by meaning using natural language |
-| `gmail_find_similar` | Find emails semantically similar to a given email |
-| `gmail_index_stats` | Get vector index statistics |
+| `gmail_index_emails` | Index emails with pagination, auto-enrich, promo filter |
+| `gmail_semantic_search` | Natural language search via pgvector |
+| `gmail_find_similar` | Find semantically similar emails |
+| `gmail_index_stats` | Index statistics |
 
-### How Semantic Search Works
-
-The server uses the [all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2) model to generate 384-dimensional embeddings locally — no external API calls needed. Embeddings are stored in SQLite and searched via cosine similarity.
-
-To use it:
-1. Call `gmail_index_emails` to index your recent emails (runs once, skips already-indexed)
-2. Call `gmail_semantic_search` with natural language queries
-3. Call `gmail_find_similar` with a message ID to discover related conversations
-
-## Architecture
-
-```
-claude.ai / MCP Client
-    │
-    ├── MCP OAuth ──→ /.well-known/oauth-authorization-server
-    │                  /authorize  →  Google OAuth  →  /google/callback
-    │                  /token (exchange code for bearer token)
-    │                  /register (dynamic client registration)
-    │
-    └── MCP Protocol ──→ /mcp (Bearer auth required)
-                          │
-                          ├── Gmail API (per-user OAuth tokens)
-                          └── Vector DB (SQLite + local embeddings)
-```
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/server.ts` | Express HTTP server, MCP tool definitions, OAuth middleware |
-| `src/auth.ts` | Google OAuth proxy — bridges MCP OAuth to Google OAuth |
-| `src/gmail-operations.ts` | Gmail API operations (send, read, reply, search, labels) |
-| `src/vector-db.ts` | SQLite vector store with local transformer embeddings |
-
-### Auth Flow
-
-When a user connects via claude.ai:
-
-1. Claude.ai discovers OAuth metadata at `/.well-known/oauth-authorization-server`
-2. Claude.ai dynamically registers as a client via `/register`
-3. User is redirected to `/authorize` → Google OAuth consent screen
-4. Google redirects back to `/google/callback` with an authorization code
-5. Server exchanges the Google code for Gmail tokens, stores them, and issues an MCP auth code
-6. Claude.ai exchanges the MCP auth code for a bearer token at `/token`
-7. All subsequent MCP requests include the bearer token, which maps to the user's Gmail tokens
-
-Each user's Gmail tokens are isolated. The server can handle multiple concurrent users.
-
-## Data Storage
-
-All persistent data is stored in `~/.gmail-mcp/`:
-
-| File | Description |
+### AI Enrichment
+| Tool | Description |
 |------|-------------|
-| `credentials.json` | Google OAuth client credentials (you provide this) |
-| `{email}_token.json` | Per-user Google OAuth tokens (auto-created on auth) |
-| `emails_vector.db` | SQLite database with email embeddings |
+| `gmail_enrich_emails` | Extract intent, entities, projects, topics via Haiku |
+| `gmail_enrich_stats` | Enrichment coverage and breakdown |
+| `gmail_reembed_enriched` | Re-embed with enriched metadata for better search |
+
+### Knowledge Graph
+| Tool | Description |
+|------|-------------|
+| `gmail_find_related` | 3-way search: project + entity + vector overlap |
+| `gmail_multi_hop` | Traverse entity connections across 1-3 hops |
+
+### Project Management
+| Tool | Description |
+|------|-------------|
+| `gmail_list_projects` | All projects with stats |
+| `gmail_project_emails` | Emails in a project |
+| `gmail_project_summary` | AI-generated project narrative |
+| `gmail_consolidate_projects` | AI-driven merge of duplicate projects |
+| `gmail_assign_orphans` | Assign unprojecte emails via entity overlap |
+
+### Corrections & Self-Improvement
+| Tool | Description |
+|------|-------------|
+| `gmail_assign_project` | Manually assign email to project |
+| `gmail_merge_projects` | Merge two projects |
+| `gmail_rename_project` | Rename a project |
+| `gmail_recluster` | Full cycle: consolidate + orphans + stale cleanup |
+| `gmail_enrichment_review` | Coverage stats and correction patterns |
+
+## Database Schema
+
+10 tables in PostgreSQL with pgvector:
+
+- **oauth_clients** / **oauth_tokens** — MCP OAuth state (survives restarts)
+- **emails** — Indexed email metadata + 384-dim vector embeddings
+- **email_enrichment** — AI-extracted intent, project, sentiment, type
+- **entities** / **email_entities** — Named entity graph
+- **projects** / **email_projects** — Life project clustering
+- **email_tags** — Topic tags
+- **enrichment_corrections** — Manual correction log
+
+## Deployment
+
+### Railway
+
+```bash
+# railway.toml is included
+# 1. Create Railway project
+# 2. Add Postgres plugin
+# 3. Set environment variables: DATABASE_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ANTHROPIC_API_KEY, BASE_URL
+# 4. Deploy from GitHub
+```
+
+### Docker
+
+```bash
+docker-compose up --build
+```
 
 ## Security
 
-- OAuth 2.0 only — no passwords stored
-- Minimal Gmail scopes (send, read, compose, modify)
-- PKCE (S256) enforced on all authorization flows
-- Per-user token isolation
-- Bearer tokens expire after 1 hour with refresh token rotation
-- Google tokens auto-refresh transparently
-
-## Development
-
-```bash
-# Run tests (embedding + vector DB)
-npm test
-
-# Type check
-npx tsc --noEmit
-
-# Build
-npm run build
-```
+- OAuth 2.0 with PKCE (S256) for MCP authentication
+- Google OAuth tokens encrypted in Postgres (not filesystem)
+- Per-user data isolation
+- Bearer tokens with 1-hour expiry and refresh rotation
+- Parameterized SQL queries throughout (no interpolation)
 
 ## License
 
