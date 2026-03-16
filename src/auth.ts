@@ -1,7 +1,5 @@
 import { google } from "googleapis";
 import { OAuth2Client } from "google-auth-library";
-import * as fs from "fs";
-import * as path from "path";
 import { randomUUID, randomBytes } from "crypto";
 import type { Response } from "express";
 import type {
@@ -15,6 +13,7 @@ import type {
   OAuthTokenRevocationRequest,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { db } from "./db.js";
 
 const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
@@ -23,7 +22,7 @@ const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
 ];
 
-// ─── In-memory stores ───
+// ─── Short-lived in-memory stores (OK to lose on restart) ───
 
 interface PendingAuth {
   mcpClientId: string;
@@ -33,59 +32,36 @@ interface PendingAuth {
   googleState: string;
 }
 
-interface TokenRecord {
-  googleTokens: any;
-  email: string;
-  clientId: string;
-  scopes: string[];
-  expiresAt: number;
-  refreshToken?: string;
-}
+// pendingAuths and authCodes are short-lived (5 min TTL during OAuth flow) — in-memory is fine
+const pendingAuths = new Map<string, PendingAuth>();
+const authCodes = new Map<
+  string,
+  { email: string; googleTokens: any; codeChallenge: string; clientId: string }
+>();
 
 export class GmailOAuthProvider implements OAuthServerProvider {
-  private dataDir: string;
-  private credentialsPath: string;
-
-  // In-memory stores
-  private clients: Map<string, OAuthClientInformationFull> = new Map();
-  private pendingAuths: Map<string, PendingAuth> = new Map(); // googleState -> PendingAuth
-  private authCodes: Map<string, { email: string; googleTokens: any; codeChallenge: string; clientId: string }> = new Map();
-  private accessTokens: Map<string, TokenRecord> = new Map();
-  private refreshTokens: Map<string, { accessToken: string; email: string; googleTokens: any; clientId: string }> = new Map();
-
   private serverBaseUrl: string;
 
-  constructor(serverBaseUrl: string, dataDir?: string) {
+  constructor(serverBaseUrl: string) {
     this.serverBaseUrl = serverBaseUrl;
-    this.dataDir = dataDir || path.join(process.env.HOME || "~", ".gmail-mcp");
-    this.credentialsPath = path.join(this.dataDir, "credentials.json");
-    if (!fs.existsSync(this.dataDir)) {
-      fs.mkdirSync(this.dataDir, { recursive: true });
-    }
   }
 
-  getDataDir(): string {
-    return this.dataDir;
-  }
-
-  private loadGoogleCredentials(): { client_id: string; client_secret: string } {
-    if (!fs.existsSync(this.credentialsPath)) {
+  private getGoogleCredentials(): {
+    client_id: string;
+    client_secret: string;
+  } {
+    const client_id = process.env.GOOGLE_CLIENT_ID;
+    const client_secret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!client_id || !client_secret) {
       throw new Error(
-        `credentials.json not found at ${this.credentialsPath}. ` +
-          `Download OAuth credentials from Google Cloud Console and place them there.`
+        "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are required."
       );
     }
-    const creds = JSON.parse(fs.readFileSync(this.credentialsPath, "utf-8"));
-    const key = creds.installed || creds.web;
-    if (!key) {
-      throw new Error("Invalid credentials.json format.");
-    }
-    return { client_id: key.client_id, client_secret: key.client_secret };
+    return { client_id, client_secret };
   }
 
   private createGoogleOAuth2Client(): OAuth2Client {
-    const { client_id, client_secret } = this.loadGoogleCredentials();
-    // Google redirects back to our server's /google/callback
+    const { client_id, client_secret } = this.getGoogleCredentials();
     return new google.auth.OAuth2(
       client_id,
       client_secret,
@@ -97,17 +73,67 @@ export class GmailOAuthProvider implements OAuthServerProvider {
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
-      getClient: (clientId: string) => this.clients.get(clientId),
-      registerClient: (client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">) => {
+      getClient: async (
+        clientId: string
+      ): Promise<OAuthClientInformationFull | undefined> => {
+        const result = await db.query(
+          "SELECT * FROM oauth_clients WHERE client_id = $1",
+          [clientId]
+        );
+        if (result.rows.length === 0) return undefined;
+        const row = result.rows[0];
+        return {
+          client_id: row.client_id,
+          client_secret: row.client_secret || undefined,
+          client_name: row.client_name || undefined,
+          redirect_uris: row.redirect_uris || [],
+          grant_types: row.grant_types || undefined,
+          response_types: row.response_types || undefined,
+          token_endpoint_auth_method:
+            row.token_endpoint_auth_method || undefined,
+          client_id_issued_at: row.client_id_issued_at
+            ? Number(row.client_id_issued_at)
+            : undefined,
+          client_secret_expires_at: row.client_secret_expires_at
+            ? Number(row.client_secret_expires_at)
+            : undefined,
+        } as OAuthClientInformationFull;
+      },
+
+      registerClient: async (
+        client: Omit<
+          OAuthClientInformationFull,
+          "client_id" | "client_id_issued_at"
+        >
+      ): Promise<OAuthClientInformationFull> => {
         const clientId = randomUUID();
-        const full: OAuthClientInformationFull = {
+        const issuedAt = Math.floor(Date.now() / 1000);
+
+        await db.query(
+          `INSERT INTO oauth_clients (client_id, client_secret, client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_id_issued_at, client_secret_expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            clientId,
+            (client as any).client_secret || null,
+            (client as any).client_name || null,
+            (client as any).redirect_uris || [],
+            (client as any).grant_types || null,
+            (client as any).response_types || null,
+            (client as any).token_endpoint_auth_method || null,
+            issuedAt,
+            (client as any).client_secret_expires_at || null,
+          ]
+        );
+
+        console.log(
+          `Registered MCP client: ${clientId} (${(client as any).client_name || "unnamed"})`
+        );
+
+        return {
           ...client,
           client_id: clientId,
-          client_id_issued_at: Math.floor(Date.now() / 1000),
-        };
-        this.clients.set(clientId, full);
-        console.log(`Registered MCP client: ${clientId} (${client.client_name || "unnamed"})`);
-        return full;
+          client_id_issued_at: issuedAt,
+        } as OAuthClientInformationFull;
       },
     };
   }
@@ -117,11 +143,9 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    // Generate a unique state for Google OAuth that we'll use to link back
     const googleState = randomBytes(32).toString("hex");
 
-    // Save the MCP client's params so we can redirect back after Google auth
-    this.pendingAuths.set(googleState, {
+    pendingAuths.set(googleState, {
       mcpClientId: client.client_id,
       mcpRedirectUri: params.redirectUri,
       mcpState: params.state,
@@ -129,7 +153,9 @@ export class GmailOAuthProvider implements OAuthServerProvider {
       googleState,
     });
 
-    // Redirect user to Google OAuth
+    // Auto-expire after 5 minutes
+    setTimeout(() => pendingAuths.delete(googleState), 300000);
+
     const oauth2Client = this.createGoogleOAuth2Client();
     const googleAuthUrl = oauth2Client.generateAuthUrl({
       access_type: "offline",
@@ -138,35 +164,32 @@ export class GmailOAuthProvider implements OAuthServerProvider {
       state: googleState,
     });
 
-    console.log(`Redirecting to Google OAuth for client ${client.client_id}`);
+    console.log(
+      `Redirecting to Google OAuth for client ${client.client_id}`
+    );
     res.redirect(googleAuthUrl);
   }
 
-  // Called by our /google/callback route
-  async handleGoogleCallback(code: string, state: string): Promise<{ redirectUrl: string }> {
-    const pending = this.pendingAuths.get(state);
+  async handleGoogleCallback(
+    code: string,
+    state: string
+  ): Promise<{ redirectUrl: string }> {
+    const pending = pendingAuths.get(state);
     if (!pending) {
       throw new Error("Invalid or expired OAuth state");
     }
-    this.pendingAuths.delete(state);
+    pendingAuths.delete(state);
 
-    // Exchange Google auth code for tokens
     const oauth2Client = this.createGoogleOAuth2Client();
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
-    // Get user email
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
     const profile = await gmail.users.getProfile({ userId: "me" });
     const email = profile.data.emailAddress!;
 
-    // Save Google tokens to disk for persistence
-    const tokenPath = path.join(this.dataDir, `${email.replace(/[^a-zA-Z0-9@.]/g, "_")}_token.json`);
-    fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
-
-    // Generate an MCP auth code that maps to the Google tokens
     const mcpAuthCode = randomBytes(32).toString("hex");
-    this.authCodes.set(mcpAuthCode, {
+    authCodes.set(mcpAuthCode, {
       email,
       googleTokens: tokens,
       codeChallenge: pending.mcpCodeChallenge,
@@ -174,16 +197,17 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     });
 
     // Auto-expire auth code after 5 minutes
-    setTimeout(() => this.authCodes.delete(mcpAuthCode), 300000);
+    setTimeout(() => authCodes.delete(mcpAuthCode), 300000);
 
-    // Build redirect URL back to MCP client
     const redirectUrl = new URL(pending.mcpRedirectUri);
     redirectUrl.searchParams.set("code", mcpAuthCode);
     if (pending.mcpState) {
       redirectUrl.searchParams.set("state", pending.mcpState);
     }
 
-    console.log(`Google OAuth complete for ${email}, redirecting to MCP client`);
+    console.log(
+      `Google OAuth complete for ${email}, redirecting to MCP client`
+    );
     return { redirectUrl: redirectUrl.toString() };
   }
 
@@ -191,7 +215,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<string> {
-    const record = this.authCodes.get(authorizationCode);
+    const record = authCodes.get(authorizationCode);
     if (!record) {
       throw new Error("Invalid authorization code");
     }
@@ -202,31 +226,48 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<OAuthTokens> {
-    const record = this.authCodes.get(authorizationCode);
+    const record = authCodes.get(authorizationCode);
     if (!record) {
       throw new Error("Invalid authorization code");
     }
-    this.authCodes.delete(authorizationCode);
+    authCodes.delete(authorizationCode);
 
-    // Create our own access token that maps to the Google tokens
     const accessToken = randomBytes(32).toString("hex");
     const mcpRefreshToken = randomBytes(32).toString("hex");
     const expiresIn = 3600; // 1 hour
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
-    this.accessTokens.set(accessToken, {
-      googleTokens: record.googleTokens,
-      email: record.email,
-      clientId: record.clientId,
-      scopes: ["gmail"],
-      expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
-    });
+    // Store both tokens in Postgres
+    await db.query(
+      `INSERT INTO oauth_tokens (token, token_type, client_id, user_email, google_access_token, google_refresh_token, google_expiry_date, scopes, expires_at, related_token)
+       VALUES ($1, 'access', $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        accessToken,
+        record.clientId,
+        record.email,
+        record.googleTokens.access_token,
+        record.googleTokens.refresh_token,
+        record.googleTokens.expiry_date,
+        ["gmail"],
+        expiresAt,
+        mcpRefreshToken,
+      ]
+    );
 
-    this.refreshTokens.set(mcpRefreshToken, {
-      accessToken,
-      email: record.email,
-      googleTokens: record.googleTokens,
-      clientId: record.clientId,
-    });
+    await db.query(
+      `INSERT INTO oauth_tokens (token, token_type, client_id, user_email, google_access_token, google_refresh_token, google_expiry_date, scopes, related_token)
+       VALUES ($1, 'refresh', $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        mcpRefreshToken,
+        record.clientId,
+        record.email,
+        record.googleTokens.access_token,
+        record.googleTokens.refresh_token,
+        record.googleTokens.expiry_date,
+        ["gmail"],
+        accessToken,
+      ]
+    );
 
     console.log(`Issued MCP tokens for ${record.email}`);
 
@@ -243,43 +284,58 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     refreshToken: string
   ): Promise<OAuthTokens> {
-    const record = this.refreshTokens.get(refreshToken);
-    if (!record) {
+    const result = await db.query(
+      "SELECT * FROM oauth_tokens WHERE token = $1 AND token_type = 'refresh'",
+      [refreshToken]
+    );
+    if (result.rows.length === 0) {
       throw new Error("Invalid refresh token");
     }
 
-    // Invalidate old access token
-    this.accessTokens.delete(record.accessToken);
+    const row = result.rows[0];
 
-    // Reload Google tokens from disk (may have been refreshed)
-    const email = record.email;
-    const tokenPath = path.join(this.dataDir, `${email.replace(/[^a-zA-Z0-9@.]/g, "_")}_token.json`);
-    let googleTokens = record.googleTokens;
-    if (fs.existsSync(tokenPath)) {
-      googleTokens = JSON.parse(fs.readFileSync(tokenPath, "utf-8"));
-    }
+    // Delete old access + refresh tokens
+    await db.query("DELETE FROM oauth_tokens WHERE token = $1", [
+      row.related_token,
+    ]);
+    await db.query("DELETE FROM oauth_tokens WHERE token = $1", [refreshToken]);
 
-    // Issue new access token
+    // Issue new tokens
     const newAccessToken = randomBytes(32).toString("hex");
     const newRefreshToken = randomBytes(32).toString("hex");
     const expiresIn = 3600;
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
-    this.accessTokens.set(newAccessToken, {
-      googleTokens,
-      email,
-      clientId: record.clientId,
-      scopes: ["gmail"],
-      expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
-    });
+    await db.query(
+      `INSERT INTO oauth_tokens (token, token_type, client_id, user_email, google_access_token, google_refresh_token, google_expiry_date, scopes, expires_at, related_token)
+       VALUES ($1, 'access', $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        newAccessToken,
+        row.client_id,
+        row.user_email,
+        row.google_access_token,
+        row.google_refresh_token,
+        row.google_expiry_date,
+        row.scopes,
+        expiresAt,
+        newRefreshToken,
+      ]
+    );
 
-    // Update refresh token mapping
-    this.refreshTokens.delete(refreshToken);
-    this.refreshTokens.set(newRefreshToken, {
-      accessToken: newAccessToken,
-      email,
-      googleTokens,
-      clientId: record.clientId,
-    });
+    await db.query(
+      `INSERT INTO oauth_tokens (token, token_type, client_id, user_email, google_access_token, google_refresh_token, google_expiry_date, scopes, related_token)
+       VALUES ($1, 'refresh', $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        newRefreshToken,
+        row.client_id,
+        row.user_email,
+        row.google_access_token,
+        row.google_refresh_token,
+        row.google_expiry_date,
+        row.scopes,
+        newAccessToken,
+      ]
+    );
 
     return {
       access_token: newAccessToken,
@@ -291,18 +347,24 @@ export class GmailOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const record = this.accessTokens.get(token);
-    if (!record) {
+    const result = await db.query(
+      "SELECT * FROM oauth_tokens WHERE token = $1 AND token_type = 'access' AND (expires_at IS NULL OR expires_at > NOW())",
+      [token]
+    );
+    if (result.rows.length === 0) {
       throw new Error("Invalid access token");
     }
 
+    const row = result.rows[0];
     return {
       token,
-      clientId: record.clientId,
-      scopes: record.scopes,
-      expiresAt: record.expiresAt,
+      clientId: row.client_id,
+      scopes: row.scopes || ["gmail"],
+      expiresAt: row.expires_at
+        ? Math.floor(new Date(row.expires_at).getTime() / 1000)
+        : undefined,
       extra: {
-        email: record.email,
+        email: row.user_email,
       },
     };
   }
@@ -311,8 +373,19 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest
   ): Promise<void> {
-    this.accessTokens.delete(request.token);
-    this.refreshTokens.delete(request.token);
+    // Also delete the related token (access ↔ refresh pair)
+    const result = await db.query(
+      "SELECT related_token FROM oauth_tokens WHERE token = $1",
+      [request.token]
+    );
+    await db.query("DELETE FROM oauth_tokens WHERE token = $1", [
+      request.token,
+    ]);
+    if (result.rows.length > 0 && result.rows[0].related_token) {
+      await db.query("DELETE FROM oauth_tokens WHERE token = $1", [
+        result.rows[0].related_token,
+      ]);
+    }
   }
 
   // ─── Gmail service for tool handlers ───
@@ -321,26 +394,48 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     gmail: ReturnType<typeof google.gmail>;
     email: string;
   }> {
-    const record = this.accessTokens.get(token);
-    if (!record) {
-      throw new Error("Invalid or expired access token. Please re-authenticate.");
+    const result = await db.query(
+      "SELECT * FROM oauth_tokens WHERE token = $1 AND token_type = 'access'",
+      [token]
+    );
+    if (result.rows.length === 0) {
+      throw new Error(
+        "Invalid or expired access token. Please re-authenticate."
+      );
     }
 
+    const row = result.rows[0];
     const oauth2Client = this.createGoogleOAuth2Client();
-    oauth2Client.setCredentials(record.googleTokens);
+    oauth2Client.setCredentials({
+      access_token: row.google_access_token,
+      refresh_token: row.google_refresh_token,
+      expiry_date: row.google_expiry_date
+        ? Number(row.google_expiry_date)
+        : undefined,
+    });
 
-    // Handle token refresh
-    oauth2Client.on("tokens", (newTokens) => {
-      record.googleTokens = { ...record.googleTokens, ...newTokens };
-      // Persist refreshed tokens
-      const tokenPath = path.join(
-        this.dataDir,
-        `${record.email.replace(/[^a-zA-Z0-9@.]/g, "_")}_token.json`
-      );
-      fs.writeFileSync(tokenPath, JSON.stringify(record.googleTokens, null, 2));
+    // Handle Google token refresh — persist new tokens to Postgres
+    oauth2Client.on("tokens", async (newTokens) => {
+      try {
+        await db.query(
+          `UPDATE oauth_tokens
+           SET google_access_token = COALESCE($1, google_access_token),
+               google_refresh_token = COALESCE($2, google_refresh_token),
+               google_expiry_date = COALESCE($3, google_expiry_date)
+           WHERE user_email = $4`,
+          [
+            newTokens.access_token || null,
+            newTokens.refresh_token || null,
+            newTokens.expiry_date || null,
+            row.user_email,
+          ]
+        );
+      } catch (err) {
+        console.error("[Auth] Failed to persist refreshed Google tokens:", err);
+      }
     });
 
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
-    return { gmail, email: record.email };
+    return { gmail, email: row.user_email };
   }
 }

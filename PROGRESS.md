@@ -39,4 +39,32 @@ LanceDB at `~/.gmail-mcp/emails_lance/`. Embeddings from `Xenova/all-MiniLM-L6-v
 
 ## Sprint 0: Docker + PostgreSQL Foundation
 
+Status: COMPLETE
+
+### What was built
+- Docker Compose with pgvector/pgvector:pg16 (port 5433 locally, 5432 internally)
+- Dockerfile for containerized deployment
+- `src/db.ts` — PostgreSQL connection pool (max 20), migrations, HNSW index creation, token cleanup
+- `src/vector-store.ts` — pgvector-backed vector store replacing LanceDB, same embedding model (Xenova/all-MiniLM-L6-v2, 384-dim)
+- `src/auth.ts` — Rewritten to use Postgres for oauth_clients and oauth_tokens. pendingAuths/authCodes remain in-memory (short-lived). Removed all filesystem JSON operations.
+- `src/server.ts` — Updated startup sequence (db.initialize → createHnswIndex → Express), request logging middleware, health check includes DB status
+- Full schema: 10 tables (oauth_clients, oauth_tokens, emails, email_enrichment, entities, email_entities, projects, email_projects, email_tags, enrichment_corrections)
+- Google credentials now read from GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars instead of credentials.json file
+
+### What worked
+- All migrations idempotent (IF NOT EXISTS)
+- OAuth client registration persists to Postgres
+- 401 on unauthenticated MCP requests
+- Health endpoint checks DB connectivity
+- Clean TypeScript build
+
+### Files created/modified
+- Created: docker-compose.yml, Dockerfile, .dockerignore, .env, src/db.ts, src/vector-store.ts
+- Modified: src/auth.ts, src/server.ts, .gitignore, package.json
+- Deleted: src/vector-db.ts, src/test.ts
+
+---
+
+## Sprint 1: Enrichment Pipeline
+
 Status: IN PROGRESS

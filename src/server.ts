@@ -5,6 +5,7 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import express from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
+import { db } from "./db.js";
 import { GmailOAuthProvider } from "./auth.js";
 import {
   sendEmail,
@@ -18,13 +19,17 @@ import {
   trashEmail,
   getLabels,
 } from "./gmail-operations.js";
-import { VectorDB } from "./vector-db.js";
+import {
+  indexEmails,
+  semanticSearch,
+  findSimilar,
+  getIndexStats,
+} from "./vector-store.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const authProvider = new GmailOAuthProvider(BASE_URL);
-const vectorDB = new VectorDB(authProvider.getDataDir());
 
 // Helper to get Gmail service from the auth info in tool extra
 async function getGmailFromExtra(extra: any) {
@@ -374,7 +379,7 @@ function createServer(): McpServer {
         const fullQuery = query ? `${dateFilter} ${query}` : dateFilter;
 
         const emails = await getRecentEmails(gmail, max_results, fullQuery);
-        const result = await vectorDB.indexEmails(email, emails);
+        const result = await indexEmails(email, emails);
         return {
           content: [
             {
@@ -415,13 +420,13 @@ function createServer(): McpServer {
     async ({ query, limit }, extra) => {
       try {
         const email = getEmailFromExtra(extra);
-        const results = await vectorDB.semanticSearch(email, query, limit);
+        const results = await semanticSearch(query, email, limit);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
-                results.map((r) => ({
+                results.map((r: any) => ({
                   ...r,
                   similarity: Math.round(r.similarity * 1000) / 1000,
                 })),
@@ -450,13 +455,13 @@ function createServer(): McpServer {
     async ({ message_id, limit }, extra) => {
       try {
         const email = getEmailFromExtra(extra);
-        const results = await vectorDB.findSimilarEmails(email, message_id, limit);
+        const results = await findSimilar(message_id, email, limit);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
-                results.map((r) => ({
+                results.map((r: any) => ({
                   ...r,
                   similarity: Math.round(r.similarity * 1000) / 1000,
                 })),
@@ -482,7 +487,7 @@ function createServer(): McpServer {
     async (_, extra) => {
       try {
         const email = getEmailFromExtra(extra);
-        const stats = await vectorDB.getIndexStats(email);
+        const stats = await getIndexStats(email);
         return {
           content: [
             {
@@ -505,105 +510,137 @@ function createServer(): McpServer {
 
 // ─── HTTP Server Setup ───
 
-const app = express();
-app.use(express.json());
+async function main() {
+  // 1. Initialize database
+  await db.initialize();
 
-// Install MCP OAuth routes (/.well-known/*, /authorize, /token, /register, /revoke)
-const issuerUrl = new URL(BASE_URL);
-app.use(
-  mcpAuthRouter({
-    provider: authProvider,
-    issuerUrl,
-    scopesSupported: ["gmail"],
-    resourceName: "Gmail MCP Server",
-  })
-);
+  // 2. Create HNSW index if emails exist
+  await db.createHnswIndexIfNeeded();
 
-// Google OAuth callback — this is where Google redirects after user consent
-app.get("/google/callback", async (req, res) => {
-  try {
-    const code = req.query.code as string;
-    const state = req.query.state as string;
+  const app = express();
+  app.use(express.json());
 
-    if (!code || !state) {
-      res.status(400).send("Missing code or state parameter");
+  // Request logging
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on("finish", () => {
+      const duration = Date.now() - start;
+      console.log(
+        `[${new Date().toISOString()}] ${req.method} ${req.path} ${res.statusCode} ${duration}ms`
+      );
+    });
+    next();
+  });
+
+  // Install MCP OAuth routes
+  const issuerUrl = new URL(BASE_URL);
+  app.use(
+    mcpAuthRouter({
+      provider: authProvider,
+      issuerUrl,
+      scopesSupported: ["gmail"],
+      resourceName: "Gmail MCP Server",
+    })
+  );
+
+  // Google OAuth callback
+  app.get("/google/callback", async (req, res) => {
+    try {
+      const code = req.query.code as string;
+      const state = req.query.state as string;
+
+      if (!code || !state) {
+        res.status(400).send("Missing code or state parameter");
+        return;
+      }
+
+      const { redirectUrl } = await authProvider.handleGoogleCallback(
+        code,
+        state
+      );
+      res.redirect(redirectUrl);
+    } catch (error: any) {
+      console.error("Google callback error:", error);
+      res.status(500).send(`Authentication failed: ${error.message}`);
+    }
+  });
+
+  // Bearer auth middleware for MCP endpoints
+  const bearerAuth = requireBearerAuth({
+    verifier: authProvider,
+    resourceMetadataUrl: "/.well-known/oauth-protected-resource",
+  });
+
+  // Store transports by session ID
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  app.post("/mcp", bearerAuth, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    if (sessionId && transports[sessionId]) {
+      await transports[sessionId].handleRequest(req, res, req.body);
       return;
     }
 
-    const { redirectUrl } = await authProvider.handleGoogleCallback(code, state);
-    res.redirect(redirectUrl);
-  } catch (error: any) {
-    console.error("Google callback error:", error);
-    res.status(500).send(`Authentication failed: ${error.message}`);
-  }
-});
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        transports[sid] = transport;
+        console.log(`MCP session created: ${sid}`);
+      },
+    });
 
-// Bearer auth middleware for MCP endpoints
-const bearerAuth = requireBearerAuth({
-  verifier: authProvider,
-  resourceMetadataUrl: "/.well-known/oauth-protected-resource",
-});
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && transports[sid]) {
+        delete transports[sid];
+        console.log(`MCP session closed: ${sid}`);
+      }
+    };
 
-// Store transports by session ID
-const transports: Record<string, StreamableHTTPServerTransport> = {};
-
-app.post("/mcp", bearerAuth, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-  if (sessionId && transports[sessionId]) {
-    await transports[sessionId].handleRequest(req, res, req.body);
-    return;
-  }
-
-  // New session
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (sid) => {
-      transports[sid] = transport;
-      console.log(`MCP session created: ${sid}`);
-    },
+    const server = createServer();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   });
 
-  transport.onclose = () => {
-    const sid = transport.sessionId;
-    if (sid && transports[sid]) {
-      delete transports[sid];
-      console.log(`MCP session closed: ${sid}`);
+  app.get("/mcp", bearerAuth, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).json({ error: "Invalid or missing session ID" });
+      return;
     }
-  };
+    await transports[sessionId].handleRequest(req, res);
+  });
 
-  const server = createServer();
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-});
+  app.delete("/mcp", bearerAuth, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).json({ error: "Invalid or missing session ID" });
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  });
 
-app.get("/mcp", bearerAuth, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).json({ error: "Invalid or missing session ID" });
-    return;
-  }
-  await transports[sessionId].handleRequest(req, res);
-});
+  // Health check (no auth required)
+  app.get("/health", async (_req, res) => {
+    try {
+      await db.query("SELECT 1");
+      res.json({ status: "ok", server: "gmail-mcp", version: "1.0.0", database: "connected" });
+    } catch {
+      res.status(503).json({ status: "error", server: "gmail-mcp", database: "disconnected" });
+    }
+  });
 
-app.delete("/mcp", bearerAuth, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).json({ error: "Invalid or missing session ID" });
-    return;
-  }
-  await transports[sessionId].handleRequest(req, res);
-});
+  // 3. Start Express server
+  app.listen(PORT, () => {
+    console.log(`Gmail MCP server running on ${BASE_URL}`);
+    console.log(`MCP endpoint: ${BASE_URL}/mcp`);
+    console.log(`OAuth metadata: ${BASE_URL}/.well-known/oauth-authorization-server`);
+    console.log(`Health check: ${BASE_URL}/health`);
+  });
+}
 
-// Health check (no auth required)
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "gmail-mcp", version: "1.0.0" });
-});
-
-app.listen(PORT, () => {
-  console.log(`Gmail MCP server running on ${BASE_URL}`);
-  console.log(`MCP endpoint: ${BASE_URL}/mcp`);
-  console.log(`OAuth metadata: ${BASE_URL}/.well-known/oauth-authorization-server`);
-  console.log(`Health check: ${BASE_URL}/health`);
-  console.log(`Data directory: ${authProvider.getDataDir()}`);
+main().catch((err) => {
+  console.error("Fatal startup error:", err);
+  process.exit(1);
 });

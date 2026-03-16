@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: gmail_mcp
+      POSTGRES_USER: gmail_mcp
+      POSTGRES_PASSWORD: gmail_mcp
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmail_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "3847:3847"
+    environment:
+      DATABASE_URL: postgresql://gmail_mcp:gmail_mcp@db:5432/gmail_mcp
+      PORT: "3847"
+      BASE_URL: "${BASE_URL:-http://localhost:3847}"
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - model_cache:/root/.cache
+
+volumes:
+  pgdata:
+  model_cache:

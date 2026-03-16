@@ -4,7 +4,9 @@ dist/
 *.d.ts.map
 
 # Secrets - never commit
+.env
 credentials.json
 *_token.json
 session_registry.json
 emails_vector.db
+emails_lance/
