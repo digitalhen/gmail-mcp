@@ -149,27 +149,16 @@ export async function createDraft(
     lines.push(`In-Reply-To: ${inReplyTo}`);
     lines.push(`References: ${inReplyTo}`);
   }
-  // Build multipart/alternative with both text/plain and text/html
-  // Gmail's compose window needs this to render the body in the editor
-  const boundary = `----=_Part_${Date.now()}`;
-  lines.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
-  lines.push("");
-
-  // text/plain part
-  lines.push(`--${boundary}`);
-  lines.push("Content-Type: text/plain; charset=utf-8");
-  lines.push("");
-  lines.push(body);
-  lines.push("");
-
-  // text/html part
-  const htmlBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
-  lines.push(`--${boundary}`);
+  // Gmail web compose needs text/html with the body BEFORE a gmail_quote div
+  // to distinguish new content from quoted original
+  const htmlBody = body
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
   lines.push("Content-Type: text/html; charset=utf-8");
   lines.push("");
-  lines.push(`<div dir="ltr">${htmlBody}</div>`);
-  lines.push("");
-  lines.push(`--${boundary}--`);
+  lines.push(`<div dir="ltr">${htmlBody}</div><br><div class="gmail_quote"></div>`);
 
   const raw = Buffer.from(lines.join("\r\n"), "utf-8").toString("base64url");
 
