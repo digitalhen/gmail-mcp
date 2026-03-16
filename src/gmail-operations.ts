@@ -111,6 +111,49 @@ export async function sendEmail(
   };
 }
 
+export async function createDraft(
+  gmail: gmail_v1.Gmail,
+  to: string,
+  subject: string,
+  body: string,
+  cc?: string,
+  bcc?: string,
+  inReplyTo?: string,
+  threadId?: string
+): Promise<{ id: string; messageId: string; threadId: string; message: string }> {
+  const lines: string[] = [];
+  lines.push(`To: ${to}`);
+  if (cc) lines.push(`Cc: ${cc}`);
+  if (bcc) lines.push(`Bcc: ${bcc}`);
+  lines.push(`Subject: ${subject}`);
+  if (inReplyTo) {
+    lines.push(`In-Reply-To: ${inReplyTo}`);
+    lines.push(`References: ${inReplyTo}`);
+  }
+  lines.push("Content-Type: text/plain; charset=utf-8");
+  lines.push("");
+  lines.push(body);
+
+  const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
+
+  const res = await gmail.users.drafts.create({
+    userId: "me",
+    requestBody: {
+      message: {
+        raw,
+        ...(threadId ? { threadId } : {}),
+      },
+    },
+  });
+
+  return {
+    id: res.data.id || "",
+    messageId: res.data.message?.id || "",
+    threadId: res.data.message?.threadId || "",
+    message: `Draft created successfully (to: ${to})`,
+  };
+}
+
 export async function getRecentEmails(
   gmail: gmail_v1.Gmail,
   maxResults: number = 10,

@@ -9,6 +9,7 @@ import { db } from "./db.js";
 import { GmailOAuthProvider } from "./auth.js";
 import {
   sendEmail,
+  createDraft,
   getRecentEmails,
   getEmail,
   getThread,
@@ -119,6 +120,37 @@ function createServer(): McpServer {
       } catch (error: any) {
         return {
           content: [{ type: "text", text: `Error sending email: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "create_draft",
+    "Create a draft email without sending it. The draft will appear in Gmail's Drafts folder.",
+    {
+      to: z.string().describe("Recipient email address(es), comma-separated"),
+      subject: z.string().describe("Email subject line"),
+      body: z.string().describe("Email body text"),
+      cc: z.string().optional().describe("CC recipients, comma-separated"),
+      bcc: z.string().optional().describe("BCC recipients, comma-separated"),
+    },
+    async ({ to, subject, body, cc, bcc }, extra) => {
+      try {
+        const { gmail, email } = await getGmailFromExtra(extra);
+        const result = await createDraft(gmail, to, subject, body, cc, bcc);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ ...result, account: email }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error creating draft: ${error.message}` }],
           isError: true,
         };
       }
