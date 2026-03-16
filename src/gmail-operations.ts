@@ -131,9 +131,10 @@ export async function createDraft(
   inReplyTo?: string,
   threadId?: string
 ): Promise<{ id: string; messageId: string; threadId: string; message: string }> {
-  // Get the user's email for the From header — Gmail needs this for drafts to be editable
-  const profile = await gmail.users.getProfile({ userId: "me" });
-  const fromEmail = profile.data.emailAddress || "";
+  // Use the default send-as address for From header — Gmail web UI requires this
+  const sendAsRes = await gmail.users.settings.sendAs.list({ userId: "me" });
+  const defaultSendAs = (sendAsRes.data.sendAs || []).find((sa) => sa.isDefault);
+  const fromEmail = defaultSendAs?.sendAsEmail || (await gmail.users.getProfile({ userId: "me" })).data.emailAddress || "";
 
   const lines: string[] = [];
   lines.push(`From: ${fromEmail}`);
