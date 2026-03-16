@@ -128,18 +128,35 @@ function createServer(): McpServer {
 
   server.tool(
     "create_draft",
-    "Create a draft email without sending it. The draft will appear in Gmail's Drafts folder.",
+    "Create a draft email without sending it. The draft will appear in Gmail's Drafts folder. Supports threading via reply_to_message_id to create draft replies.",
     {
       to: z.string().describe("Recipient email address(es), comma-separated"),
       subject: z.string().describe("Email subject line"),
       body: z.string().describe("Email body text"),
       cc: z.string().optional().describe("CC recipients, comma-separated"),
       bcc: z.string().optional().describe("BCC recipients, comma-separated"),
+      reply_to_message_id: z.string().optional().describe("Message ID to reply to — sets In-Reply-To/References headers and thread ID for a threaded draft reply"),
     },
-    async ({ to, subject, body, cc, bcc }, extra) => {
+    async ({ to, subject, body, cc, bcc, reply_to_message_id }, extra) => {
       try {
         const { gmail, email } = await getGmailFromExtra(extra);
-        const result = await createDraft(gmail, to, subject, body, cc, bcc);
+
+        let inReplyTo: string | undefined;
+        let threadId: string | undefined;
+
+        if (reply_to_message_id) {
+          const original = await getEmail(gmail, reply_to_message_id);
+          inReplyTo = `<${original.id}@mail.gmail.com>`;
+          threadId = original.threadId;
+          // Auto-prefix Re: if not already present
+          if (!subject.startsWith("Re:")) {
+            subject = original.subject.startsWith("Re:")
+              ? original.subject
+              : `Re: ${original.subject}`;
+          }
+        }
+
+        const result = await createDraft(gmail, to, subject, body, cc, bcc, inReplyTo, threadId);
         return {
           content: [
             {
