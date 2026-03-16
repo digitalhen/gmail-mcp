@@ -158,7 +158,7 @@ export async function createDraft(
     .replace(/\n/g, "<br>");
   lines.push("Content-Type: text/html; charset=utf-8");
   lines.push("");
-  lines.push(`<div dir="ltr">${htmlBody}</div><br><div class="gmail_quote"></div>`);
+  lines.push(`<div dir="ltr">${htmlBody}</div><div class="gmail_quote"></div>`);
 
   const raw = Buffer.from(lines.join("\r\n"), "utf-8").toString("base64url");
 
