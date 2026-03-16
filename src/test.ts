@@ -28,7 +28,6 @@ async function testEmbeddings() {
 
   console.log("\n=== Semantic Similarity Matrix ===\n");
 
-  // Compute cosine similarities
   function cosine(a: number[], b: number[]): number {
     let dot = 0, normA = 0, normB = 0;
     for (let i = 0; i < a.length; i++) {
@@ -39,7 +38,6 @@ async function testEmbeddings() {
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
-  // Show key comparisons
   const comparisons = [
     [0, 1, "phone call ↔ FaceTime"],
     [0, 2, "phone call ↔ budget report"],
@@ -59,15 +57,13 @@ async function testEmbeddings() {
     console.log(`  ${(sim as number).toFixed(3)} ${bar} ${label}`);
   }
 
-  console.log("\n=== Testing Vector DB ===\n");
+  console.log("\n=== Testing LanceDB Vector DB ===\n");
 
-  // Use temp dir for test DB
   const testDir = path.join(os.tmpdir(), "gmail-mcp-test-" + Date.now());
   fs.mkdirSync(testDir, { recursive: true });
 
   const db = new VectorDB(testDir);
 
-  // Index mock emails
   const mockEmails = texts.map((text, i) => ({
     id: `msg_${i}`,
     threadId: `thread_${Math.floor(i / 2)}`,
@@ -83,7 +79,6 @@ async function testEmbeddings() {
   const result = await db.indexEmails("test@example.com", mockEmails);
   console.log(`  Indexed: ${result.indexed}, Skipped: ${result.skipped}`);
 
-  // Test semantic search
   console.log("\n--- Searching: 'calling someone' ---");
   const callResults = await db.semanticSearch("test@example.com", "calling someone", 5);
   for (const r of callResults) {
@@ -102,25 +97,21 @@ async function testEmbeddings() {
     console.log(`  ${r.similarity.toFixed(3)} | ${r.snippet}`);
   }
 
-  // Test find similar
   console.log("\n--- Finding similar to 'phone call' email ---");
   const similar = await db.findSimilarEmails("test@example.com", "msg_0", 5);
   for (const r of similar) {
     console.log(`  ${r.similarity.toFixed(3)} | ${r.snippet}`);
   }
 
-  // Test re-indexing (should skip)
   console.log("\n--- Re-indexing (should skip all) ---");
   const result2 = await db.indexEmails("test@example.com", mockEmails);
   console.log(`  Indexed: ${result2.indexed}, Skipped: ${result2.skipped}`);
 
-  // Stats
   console.log("\n--- Index Stats ---");
-  const stats = db.getIndexStats("test@example.com");
+  const stats = await db.getIndexStats("test@example.com");
   console.log(`  ${JSON.stringify(stats, null, 2)}`);
 
-  // Cleanup
-  db.close();
+  await db.close();
   fs.rmSync(testDir, { recursive: true });
 
   console.log("\n=== All tests passed! ===\n");

@@ -351,23 +351,29 @@ function createServer(): McpServer {
 
   server.tool(
     "gmail_index_emails",
-    "Index recent emails into the vector database for semantic search. Run this to build up the searchable index.",
+    "Index emails from the last 12 months into the vector database for semantic search. Run this to build up the searchable index. Fetches in batches and skips already-indexed emails.",
     {
       max_results: z
         .number()
         .min(1)
-        .max(100)
-        .default(50)
-        .describe("Number of recent emails to index"),
+        .max(500)
+        .default(100)
+        .describe("Maximum number of emails to index per batch (1-500)"),
       query: z
         .string()
         .optional()
-        .describe("Optional Gmail search query to filter which emails to index"),
+        .describe("Optional additional Gmail search query to filter which emails to index"),
     },
     async ({ max_results, query }, extra) => {
       try {
         const { gmail, email } = await getGmailFromExtra(extra);
-        const emails = await getRecentEmails(gmail, max_results, query);
+        // Default to last 12 months
+        const twelveMonthsAgo = new Date();
+        twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+        const dateFilter = `after:${twelveMonthsAgo.getFullYear()}/${String(twelveMonthsAgo.getMonth() + 1).padStart(2, "0")}/${String(twelveMonthsAgo.getDate()).padStart(2, "0")}`;
+        const fullQuery = query ? `${dateFilter} ${query}` : dateFilter;
+
+        const emails = await getRecentEmails(gmail, max_results, fullQuery);
         const result = await vectorDB.indexEmails(email, emails);
         return {
           content: [
@@ -378,6 +384,7 @@ function createServer(): McpServer {
                   message: `Indexed ${result.indexed} emails, skipped ${result.skipped} already-indexed emails`,
                   ...result,
                   account: email,
+                  filter: fullQuery,
                 },
                 null,
                 2
@@ -475,7 +482,7 @@ function createServer(): McpServer {
     async (_, extra) => {
       try {
         const email = getEmailFromExtra(extra);
-        const stats = vectorDB.getIndexStats(email);
+        const stats = await vectorDB.getIndexStats(email);
         return {
           content: [
             {

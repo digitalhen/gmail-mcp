@@ -1,19 +1,18 @@
-import Database from "better-sqlite3";
+import * as lancedb from "@lancedb/lancedb";
 import * as path from "path";
-import * as fs from "fs";
 
-let pipeline: any;
+let pipelineFn: any;
 let embeddingPipeline: any;
 
 async function getEmbeddingPipeline() {
   if (embeddingPipeline) return embeddingPipeline;
 
-  if (!pipeline) {
+  if (!pipelineFn) {
     const mod = await import("@huggingface/transformers");
-    pipeline = mod.pipeline;
+    pipelineFn = mod.pipeline;
   }
 
-  embeddingPipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+  embeddingPipeline = await pipelineFn("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
     dtype: "fp32",
   });
   return embeddingPipeline;
@@ -25,47 +24,74 @@ export async function generateEmbedding(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
-function cosineSimilarity(a: number[], b: number[]): number {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+interface EmailRecord {
+  [key: string]: unknown;
+  id: string;
+  user_email: string;
+  thread_id: string;
+  subject: string;
+  from_addr: string;
+  to_addr: string;
+  date: string;
+  snippet: string;
+  body_preview: string;
+  vector: number[];
+  indexed_at: string;
 }
 
+type SearchResult = {
+  id: string;
+  threadId: string;
+  subject: string;
+  from: string;
+  to: string;
+  date: string;
+  snippet: string;
+  bodyPreview: string;
+  similarity: number;
+};
+
+const TABLE_NAME = "email_embeddings";
+
 export class VectorDB {
-  private db: Database.Database;
+  private dbPath: string;
+  private db: lancedb.Connection | null = null;
+  private table: lancedb.Table | null = null;
 
   constructor(dataDir: string) {
-    const dbPath = path.join(dataDir, "emails_vector.db");
-    this.db = new Database(dbPath);
-    this.initialize();
+    this.dbPath = path.join(dataDir, "emails_lance");
   }
 
-  private initialize(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS email_embeddings (
-        id TEXT PRIMARY KEY,
-        user_email TEXT NOT NULL,
-        thread_id TEXT,
-        subject TEXT,
-        from_addr TEXT,
-        to_addr TEXT,
-        date TEXT,
-        snippet TEXT,
-        body_preview TEXT,
-        embedding BLOB NOT NULL,
-        indexed_at TEXT NOT NULL
-      );
+  private async getTable(): Promise<lancedb.Table> {
+    if (this.table) return this.table;
 
-      CREATE INDEX IF NOT EXISTS idx_email_user ON email_embeddings(user_email);
-      CREATE INDEX IF NOT EXISTS idx_email_thread ON email_embeddings(thread_id);
-      CREATE INDEX IF NOT EXISTS idx_email_date ON email_embeddings(date);
-    `);
+    if (!this.db) {
+      this.db = await lancedb.connect(this.dbPath);
+    }
+
+    const tables = await this.db.tableNames();
+    if (tables.includes(TABLE_NAME)) {
+      this.table = await this.db.openTable(TABLE_NAME);
+    }
+
+    return this.table!;
+  }
+
+  private async getOrCreateTable(firstRecord: EmailRecord): Promise<lancedb.Table> {
+    if (this.table) return this.table;
+
+    if (!this.db) {
+      this.db = await lancedb.connect(this.dbPath);
+    }
+
+    const tables = await this.db.tableNames();
+    if (tables.includes(TABLE_NAME)) {
+      this.table = await this.db.openTable(TABLE_NAME);
+    } else {
+      this.table = await this.db.createTable(TABLE_NAME, [firstRecord]);
+    }
+
+    return this.table;
   }
 
   async indexEmail(
@@ -81,7 +107,6 @@ export class VectorDB {
       body: string;
     }
   ): Promise<void> {
-    // Create text for embedding: combine subject, snippet, and body preview
     const textForEmbedding = [
       email.subject,
       email.snippet,
@@ -90,28 +115,29 @@ export class VectorDB {
       .filter(Boolean)
       .join(" ");
 
-    const embedding = await generateEmbedding(textForEmbedding);
-    const embeddingBlob = Buffer.from(new Float32Array(embedding).buffer);
+    const vector = await generateEmbedding(textForEmbedding);
 
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO email_embeddings
-         (id, user_email, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, embedding, indexed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        email.id,
-        userEmail,
-        email.threadId,
-        email.subject,
-        email.from,
-        email.to,
-        email.date,
-        email.snippet,
-        email.body.substring(0, 500),
-        embeddingBlob,
-        new Date().toISOString()
-      );
+    const record: EmailRecord = {
+      id: email.id,
+      user_email: userEmail,
+      thread_id: email.threadId,
+      subject: email.subject,
+      from_addr: email.from,
+      to_addr: email.to,
+      date: email.date,
+      snippet: email.snippet,
+      body_preview: email.body.substring(0, 500),
+      vector,
+      indexed_at: new Date().toISOString(),
+    };
+
+    const table = await this.getOrCreateTable(record);
+
+    // Check if this is the seed record (already inserted by createTable)
+    const existing = await table.countRows(`id = '${email.id.replace(/'/g, "''")}'`);
+    if (existing === 0) {
+      await table.add([record]);
+    }
   }
 
   async indexEmails(
@@ -127,20 +153,60 @@ export class VectorDB {
       body: string;
     }>
   ): Promise<{ indexed: number; skipped: number }> {
+    if (emails.length === 0) return { indexed: 0, skipped: 0 };
+
     let indexed = 0;
     let skipped = 0;
 
+    // Batch: generate embeddings and collect new records
+    const newRecords: EmailRecord[] = [];
+
     for (const email of emails) {
-      // Skip if already indexed
-      const existing = this.db
-        .prepare("SELECT id FROM email_embeddings WHERE id = ?")
-        .get(email.id);
-      if (existing) {
-        skipped++;
-        continue;
+      // Check if already indexed
+      const table = await this.getTable();
+      if (table) {
+        const exists = await table.countRows(`id = '${email.id.replace(/'/g, "''")}'`);
+        if (exists > 0) {
+          skipped++;
+          continue;
+        }
       }
-      await this.indexEmail(userEmail, email);
+
+      const textForEmbedding = [
+        email.subject,
+        email.snippet,
+        email.body.substring(0, 1000),
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      const vector = await generateEmbedding(textForEmbedding);
+
+      newRecords.push({
+        id: email.id,
+        user_email: userEmail,
+        thread_id: email.threadId,
+        subject: email.subject,
+        from_addr: email.from,
+        to_addr: email.to,
+        date: email.date,
+        snippet: email.snippet,
+        body_preview: email.body.substring(0, 500),
+        vector,
+        indexed_at: new Date().toISOString(),
+      });
       indexed++;
+    }
+
+    if (newRecords.length > 0) {
+      const table = await this.getOrCreateTable(newRecords[0]);
+      // If table was just created with first record, add the rest
+      if (newRecords.length > 1) {
+        await table.add(newRecords.slice(1));
+      } else if (this.table) {
+        // Table already existed, add all
+        await table.add(newRecords);
+      }
     }
 
     return { indexed, skipped };
@@ -150,189 +216,125 @@ export class VectorDB {
     userEmail: string,
     query: string,
     limit: number = 10
-  ): Promise<
-    Array<{
-      id: string;
-      threadId: string;
-      subject: string;
-      from: string;
-      to: string;
-      date: string;
-      snippet: string;
-      bodyPreview: string;
-      similarity: number;
-    }>
-  > {
-    const queryEmbedding = await generateEmbedding(query);
+  ): Promise<SearchResult[]> {
+    const table = await this.getTable();
+    if (!table) return [];
 
-    // Get all embeddings for this user
-    const rows = this.db
-      .prepare(
-        "SELECT id, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, embedding FROM email_embeddings WHERE user_email = ?"
-      )
-      .all(userEmail) as Array<{
-      id: string;
-      thread_id: string;
-      subject: string;
-      from_addr: string;
-      to_addr: string;
-      date: string;
-      snippet: string;
-      body_preview: string;
-      embedding: Buffer;
-    }>;
+    const queryVector = await generateEmbedding(query);
 
-    // Compute similarities
-    const results = rows.map((row) => {
-      const embedding = Array.from(
-        new Float32Array(
-          row.embedding.buffer.slice(
-            row.embedding.byteOffset,
-            row.embedding.byteOffset + row.embedding.byteLength
-          )
-        )
-      );
-      const similarity = cosineSimilarity(queryEmbedding, embedding);
-      return {
-        id: row.id,
-        threadId: row.thread_id,
-        subject: row.subject,
-        from: row.from_addr,
-        to: row.to_addr,
-        date: row.date,
-        snippet: row.snippet,
-        bodyPreview: row.body_preview,
-        similarity,
-      };
-    });
+    const results = await table
+      .query()
+      .nearestTo(queryVector)
+      .where(`user_email = '${userEmail.replace(/'/g, "''")}'`)
+      .distanceType("cosine")
+      .limit(limit)
+      .toArray();
 
-    // Sort by similarity descending
-    results.sort((a, b) => b.similarity - a.similarity);
-    return results.slice(0, limit);
+    return results.map((r: any) => ({
+      id: r.id,
+      threadId: r.thread_id,
+      subject: r.subject,
+      from: r.from_addr,
+      to: r.to_addr,
+      date: r.date,
+      snippet: r.snippet,
+      bodyPreview: r.body_preview,
+      // LanceDB cosine distance is 1 - similarity, so convert back
+      similarity: 1 - (r._distance ?? 0),
+    }));
   }
 
   async findSimilarEmails(
     userEmail: string,
     emailId: string,
     limit: number = 10
-  ): Promise<
-    Array<{
-      id: string;
-      threadId: string;
-      subject: string;
-      from: string;
-      to: string;
-      date: string;
-      snippet: string;
-      bodyPreview: string;
-      similarity: number;
-    }>
-  > {
-    // Get the source email's embedding
-    const source = this.db
-      .prepare(
-        "SELECT embedding FROM email_embeddings WHERE id = ? AND user_email = ?"
-      )
-      .get(emailId, userEmail) as { embedding: Buffer } | undefined;
+  ): Promise<SearchResult[]> {
+    const table = await this.getTable();
+    if (!table) {
+      throw new Error("No emails indexed yet. Run gmail_index_emails first.");
+    }
 
-    if (!source) {
+    // Get the source email's vector
+    const source = await table
+      .query()
+      .where(`id = '${emailId.replace(/'/g, "''")}'`)
+      .limit(1)
+      .toArray();
+
+    if (source.length === 0) {
       throw new Error(
         `Email ${emailId} not found in index. Index it first using gmail_index_emails.`
       );
     }
 
-    const sourceEmbedding = Array.from(
-      new Float32Array(
-        source.embedding.buffer.slice(
-          source.embedding.byteOffset,
-          source.embedding.byteOffset + source.embedding.byteLength
-        )
-      )
-    );
+    const sourceVector = source[0].vector;
 
-    // Get all other embeddings for this user
-    const rows = this.db
-      .prepare(
-        "SELECT id, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, embedding FROM email_embeddings WHERE user_email = ? AND id != ?"
-      )
-      .all(userEmail, emailId) as Array<{
-      id: string;
-      thread_id: string;
-      subject: string;
-      from_addr: string;
-      to_addr: string;
-      date: string;
-      snippet: string;
-      body_preview: string;
-      embedding: Buffer;
-    }>;
+    const results = await table
+      .query()
+      .nearestTo(sourceVector)
+      .where(`user_email = '${userEmail.replace(/'/g, "''")}'`)
+      .distanceType("cosine")
+      .limit(limit + 1) // +1 because the source email will be in results
+      .toArray();
 
-    const results = rows.map((row) => {
-      const embedding = Array.from(
-        new Float32Array(
-          row.embedding.buffer.slice(
-            row.embedding.byteOffset,
-            row.embedding.byteOffset + row.embedding.byteLength
-          )
-        )
-      );
-      const similarity = cosineSimilarity(sourceEmbedding, embedding);
-      return {
-        id: row.id,
-        threadId: row.thread_id,
-        subject: row.subject,
-        from: row.from_addr,
-        to: row.to_addr,
-        date: row.date,
-        snippet: row.snippet,
-        bodyPreview: row.body_preview,
-        similarity,
-      };
-    });
-
-    results.sort((a, b) => b.similarity - a.similarity);
-    return results.slice(0, limit);
+    return results
+      .filter((r: any) => r.id !== emailId)
+      .slice(0, limit)
+      .map((r: any) => ({
+        id: r.id,
+        threadId: r.thread_id,
+        subject: r.subject,
+        from: r.from_addr,
+        to: r.to_addr,
+        date: r.date,
+        snippet: r.snippet,
+        bodyPreview: r.body_preview,
+        similarity: 1 - (r._distance ?? 0),
+      }));
   }
 
-  getIndexStats(userEmail: string): {
+  async getIndexStats(userEmail: string): Promise<{
     totalEmails: number;
     oldestEmail: string | null;
     newestEmail: string | null;
     lastIndexed: string | null;
-  } {
-    const count = this.db
-      .prepare(
-        "SELECT COUNT(*) as count FROM email_embeddings WHERE user_email = ?"
-      )
-      .get(userEmail) as { count: number };
+  }> {
+    const table = await this.getTable();
+    if (!table) {
+      return { totalEmails: 0, oldestEmail: null, newestEmail: null, lastIndexed: null };
+    }
 
-    const oldest = this.db
-      .prepare(
-        "SELECT MIN(date) as date FROM email_embeddings WHERE user_email = ?"
-      )
-      .get(userEmail) as { date: string | null };
+    const totalEmails = await table.countRows(
+      `user_email = '${userEmail.replace(/'/g, "''")}'`
+    );
 
-    const newest = this.db
-      .prepare(
-        "SELECT MAX(date) as date FROM email_embeddings WHERE user_email = ?"
-      )
-      .get(userEmail) as { date: string | null };
+    if (totalEmails === 0) {
+      return { totalEmails: 0, oldestEmail: null, newestEmail: null, lastIndexed: null };
+    }
 
-    const lastIndexed = this.db
-      .prepare(
-        "SELECT MAX(indexed_at) as indexed_at FROM email_embeddings WHERE user_email = ?"
-      )
-      .get(userEmail) as { indexed_at: string | null };
+    // Get date range
+    const rows = await table
+      .query()
+      .where(`user_email = '${userEmail.replace(/'/g, "''")}'`)
+      .select(["date", "indexed_at"])
+      .toArray();
+
+    const dates = rows.map((r: any) => r.date).filter(Boolean).sort();
+    const indexDates = rows.map((r: any) => r.indexed_at).filter(Boolean).sort();
 
     return {
-      totalEmails: count.count,
-      oldestEmail: oldest.date,
-      newestEmail: newest.date,
-      lastIndexed: lastIndexed.indexed_at,
+      totalEmails,
+      oldestEmail: dates[0] || null,
+      newestEmail: dates[dates.length - 1] || null,
+      lastIndexed: indexDates[indexDates.length - 1] || null,
     };
   }
 
-  close(): void {
-    this.db.close();
+  async close(): Promise<void> {
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+      this.table = null;
+    }
   }
 }
