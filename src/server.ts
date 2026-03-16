@@ -146,7 +146,7 @@ function createServer(): McpServer {
 
         if (reply_to_message_id) {
           const original = await getEmail(gmail, reply_to_message_id);
-          inReplyTo = `<${original.id}@mail.gmail.com>`;
+          inReplyTo = original.messageIdHeader || `<${original.id}@mail.gmail.com>`;
           threadId = original.threadId;
           // Auto-prefix Re: if not already present
           if (!subject.startsWith("Re:")) {

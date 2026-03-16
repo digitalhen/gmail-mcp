@@ -3,6 +3,7 @@ import { gmail_v1 } from "googleapis";
 export interface EmailMessage {
   id: string;
   threadId: string;
+  messageIdHeader: string;
   from: string;
   to: string;
   cc: string;
@@ -59,6 +60,7 @@ function parseMessage(msg: gmail_v1.Schema$Message): EmailMessage {
   return {
     id: msg.id || "",
     threadId: msg.threadId || "",
+    messageIdHeader: getHeader(headers, "Message-ID"),
     from: getHeader(headers, "From"),
     to: getHeader(headers, "To"),
     cc: getHeader(headers, "Cc"),
@@ -242,7 +244,8 @@ export async function replyToEmail(
     ? original.subject
     : `Re: ${original.subject}`;
 
-  const messageIdHeader = `<${original.id}@mail.gmail.com>`;
+  // Use the actual RFC 2822 Message-ID header, not a fabricated one
+  const inReplyTo = original.messageIdHeader || `<${original.id}@mail.gmail.com>`;
 
   return sendEmail(
     gmail,
@@ -251,7 +254,7 @@ export async function replyToEmail(
     body,
     undefined,
     undefined,
-    messageIdHeader,
+    inReplyTo,
     original.threadId
   );
 }
