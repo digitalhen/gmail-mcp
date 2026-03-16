@@ -149,9 +149,11 @@ export async function createDraft(
     lines.push(`In-Reply-To: ${inReplyTo}`);
     lines.push(`References: ${inReplyTo}`);
   }
-  lines.push("Content-Type: text/plain; charset=utf-8");
+  // Use text/html so Gmail web UI renders the body in the draft compose window
+  const htmlBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
+  lines.push("Content-Type: text/html; charset=utf-8");
   lines.push("");
-  lines.push(body);
+  lines.push(`<div dir="ltr">${htmlBody}</div>`);
 
   const raw = Buffer.from(lines.join("\r\n"), "utf-8").toString("base64url");
 
