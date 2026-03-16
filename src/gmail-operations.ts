@@ -132,7 +132,12 @@ export async function createDraft(
   inReplyTo?: string,
   threadId?: string
 ): Promise<{ id: string; messageId: string; threadId: string; message: string }> {
+  // Get the user's email for the From header — Gmail needs this for drafts to be editable
+  const profile = await gmail.users.getProfile({ userId: "me" });
+  const fromEmail = profile.data.emailAddress || "";
+
   const lines: string[] = [];
+  lines.push(`From: ${fromEmail}`);
   lines.push(`To: ${to}`);
   if (cc) lines.push(`Cc: ${cc}`);
   if (bcc) lines.push(`Bcc: ${bcc}`);
@@ -145,7 +150,6 @@ export async function createDraft(
   lines.push("Content-Type: text/plain; charset=utf-8");
   lines.push("Content-Transfer-Encoding: base64");
   lines.push("");
-  // Base64-encode the body to avoid any charset issues
   lines.push(Buffer.from(body, "utf-8").toString("base64"));
 
   const raw = Buffer.from(lines.join("\r\n")).toString("base64url");
