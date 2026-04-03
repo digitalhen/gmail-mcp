@@ -1570,7 +1570,7 @@ async function main() {
   // Bearer auth middleware for MCP endpoints
   const bearerAuth = requireBearerAuth({
     verifier: authProvider,
-    resourceMetadataUrl: "/.well-known/oauth-protected-resource",
+    resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource", BASE_URL).href,
   });
 
   // Store transports by session ID
