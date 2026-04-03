@@ -1512,6 +1512,7 @@ async function main() {
   await db.createHnswIndexIfNeeded();
 
   const app = express();
+  app.set("trust proxy", 1);
   app.use(express.json());
 
   // Request logging
@@ -1543,7 +1544,14 @@ async function main() {
       const code = req.query.code as string;
       const state = req.query.state as string;
 
+      if (req.query.error) {
+        console.error("Google OAuth error:", req.query.error, req.query.error_description);
+        res.status(400).send(`Google OAuth error: ${req.query.error} - ${req.query.error_description || ""}`);
+        return;
+      }
+
       if (!code || !state) {
+        console.error("Google callback missing params. Query:", req.query);
         res.status(400).send("Missing code or state parameter");
         return;
       }
