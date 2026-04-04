@@ -210,14 +210,20 @@ export async function getIndexStats(userEmail: string) {
     "SELECT COUNT(*) as count FROM emails WHERE user_email = $1",
     [userEmail]
   );
-  const oldest = await db.query(
-    "SELECT date FROM emails WHERE user_email = $1 ORDER BY date ASC LIMIT 1",
+  const dateRows = await db.query(
+    "SELECT date FROM emails WHERE user_email = $1 AND date IS NOT NULL",
     [userEmail]
   );
-  const newest = await db.query(
-    "SELECT date FROM emails WHERE user_email = $1 ORDER BY date DESC LIMIT 1",
-    [userEmail]
-  );
+  let oldestDate: string | null = null;
+  let newestDate: string | null = null;
+  let oldestTs = Infinity;
+  let newestTs = -Infinity;
+  for (const row of dateRows.rows) {
+    const ts = new Date(row.date).getTime();
+    if (isNaN(ts)) continue;
+    if (ts < oldestTs) { oldestTs = ts; oldestDate = row.date; }
+    if (ts > newestTs) { newestTs = ts; newestDate = row.date; }
+  }
   const lastIndexed = await db.query(
     "SELECT indexed_at FROM emails WHERE user_email = $1 ORDER BY indexed_at DESC LIMIT 1",
     [userEmail]
@@ -225,8 +231,8 @@ export async function getIndexStats(userEmail: string) {
 
   return {
     totalEmails: parseInt(total.rows[0].count),
-    oldestEmail: oldest.rows[0]?.date || null,
-    newestEmail: newest.rows[0]?.date || null,
+    oldestEmail: oldestDate,
+    newestEmail: newestDate,
     lastIndexed: lastIndexed.rows[0]?.indexed_at || null,
   };
 }

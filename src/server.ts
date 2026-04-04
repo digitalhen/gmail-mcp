@@ -1584,6 +1584,13 @@ async function main() {
       return;
     }
 
+    // If client sent a session ID we don't recognize (e.g. after server restart),
+    // return 404 so the client knows to start a fresh session per MCP spec.
+    if (sessionId) {
+      res.status(404).json({ error: "Session not found. Please reinitialize." });
+      return;
+    }
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
