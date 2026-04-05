@@ -76,14 +76,22 @@ enrichment_loop() {
         echo "[enrich] Round $round [$(date '+%H:%M:%S')] fetching IDs"
 
         raw=$(claude -p \
-            "Call gmail_get_unenriched with max_results=500 and after_year=2017. Return ONLY a JSON array of the email ids, nothing else. Example: [\"id1\",\"id2\"]" \
+            "Call gmail_get_unenriched with max_results=500 and after_year=2017. Return ONLY a compact single-line JSON array of the email ids, no whitespace, no markdown. Example: [\"id1\",\"id2\"]" \
             --allowedTools "mcp__claude_ai_Gmail_MCP__gmail_get_unenriched" \
             --permission-mode bypassPermissions \
             --model haiku \
             --max-turns 5 \
             2>&1)
 
-        ids_json=$(echo "$raw" | grep -o '\[.*\]' | head -1)
+        # Extract JSON array — handles both single-line and multi-line/markdown output
+        ids_json=$(echo "$raw" | python3 2>/dev/null -c "
+import sys, re, json
+text = sys.stdin.read()
+m = re.search(r'\[.*?\]', text, re.DOTALL)
+if m:
+    try: print(json.dumps(json.loads(m.group())))
+    except: pass
+")
 
         if [ -z "$ids_json" ] || [ "$ids_json" = "[]" ]; then
             echo "[enrich] No unenriched emails right now, sleeping 30s..."
