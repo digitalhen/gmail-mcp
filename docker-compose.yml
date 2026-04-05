@@ -3,6 +3,7 @@ version: '3.8'
 services:
   db:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: gmail_mcp
       POSTGRES_USER: gmail_mcp
@@ -19,6 +20,7 @@ services:
 
   app:
     build: .
+    restart: unless-stopped
     ports:
       - "3847:3847"
     environment:
