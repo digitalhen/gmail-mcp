@@ -774,7 +774,7 @@ function createServer(): McpServer {
         }
 
         if (after_year) {
-          sql += ` AND (regexp_match(e.date, '\\b(20[0-9]{2}|19[0-9]{2})\\b'))[1]::int >= $${params.length + 1}`;
+          sql += ` AND (regexp_match(e.date, '(20[0-9]{2}|19[0-9]{2})'))[1]::int >= $${params.length + 1}`;
           params.push(after_year);
         }
 
