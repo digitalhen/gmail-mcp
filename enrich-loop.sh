@@ -1,48 +1,34 @@
 #!/usr/bin/env bash
 
-WORKERS="${1:-5}"
-BATCH_SIZE=100
-MAX_TURNS=30
+WORKERS=5
+MAX_TURNS=20
 
+ENRICH_PROMPT='You are an email metadata extraction engine for a personal email knowledge graph. The user is Henry Williams, based in Brooklyn, NY.
 
-make_enrich_prompt() {
-    local ids_json="$1"
-    cat <<PROMPT
-You are an email metadata extraction engine for a personal email knowledge graph. The user is Henry Williams, based in Brooklyn, NY.
-
-Call gmail_get_unenriched with max_results=500 and after_year=2017. From the returned emails, only process the ones whose id appears in this list: ${ids_json}
+Call gmail_get_unenriched with max_results=500 and after_year=2017. From the returned emails, only process the ones whose id appears in this list: IDS_PLACEHOLDER
 
 For each of those emails call gmail_write_enrichment with these fields:
+- intent_summary: One sentence what this email is about. Be specific.
+- life_project: Descriptive project name (e.g. "Family Cruise July 2025", "Tristan School PS 183") or null for transactional/promotional.
+- entities: [{name, type, role}] where type: person/place/organization/flight/document/event/institution, role: sender/recipient/mentioned/location/destination/provider/subject
+- topics: up to 5 tags from: travel, coparenting, medical, legal, career, finance, technology, family, school, home, civic, insurance, food, shopping, media, passport, immigration
+- key_dates: [{date: "YYYY-MM-DD", description}]
+- sentiment: positive/negative/neutral/urgent/confrontational
+- email_type: personal/professional/transactional/promotional/notification/legal
 
-- intent_summary: One sentence describing what this email is about in the context of someone's life. Be specific: 'Booking family flight to London' not 'Travel email'.
-- life_project: Short descriptive name for the broader project/initiative (e.g. 'Family Cruise July 2025', 'Tristan School PS 183', 'London Trip March 2026', 'Passport Applications'). Use CONSISTENT names -- don't create variants like 'UK Trip' and 'London Trip'. Set to null for purely transactional/promotional emails.
-- entities: Array of {name, type, role} where:
-    - type is one of: person, place, organization, flight, document, event, institution
-    - role is one of: sender, recipient, mentioned, location, destination, provider, subject
-    - For flight bookings: extract airline, flight number as separate entities, plus origin/destination places, and all passenger names
-    - For appointments: extract provider org, patient/client person, location
-    - For co-parenting emails: always extract children mentioned, dates discussed, locations
-- topics: Array of tags (up to 5) chosen ONLY from: travel, coparenting, medical, legal, career, finance, technology, family, school, home, civic, insurance, food, shopping, media, passport, immigration
-- key_dates: Array of {date: 'YYYY-MM-DD', description} for important dates mentioned
-- sentiment: one of: positive, negative, neutral, urgent, confrontational
-- email_type: one of: personal, professional, transactional, promotional, notification, legal
+Call gmail_write_enrichment once per email. After done report: "Processed N emails"'
 
-Rules:
-- Promotional/marketing emails: set life_project to null, email_type to 'promotional'
-- Call gmail_write_enrichment once per email, do not skip any in your assigned list
-- After all emails are written, report: 'Processed N emails'
-PROMPT
-}
+echo "=== Gmail Index + Enrichment ==="
+echo "Started: $(date)"
+echo ""
 
-# ── Indexing loop (runs in background) ──────────────────────────────────────
+# ── Indexing loop ─────────────────────────────────────────────────────────────
 indexing_loop() {
     echo "[index] Starting indexing loop"
-
-    # Generate months from Dec 2024 back to Apr 2004 (Gmail launch)
     while IFS= read -r range; do
         after=$(echo "$range" | cut -d' ' -f1)
         before=$(echo "$range" | cut -d' ' -f2)
-        echo "[index] Indexing $after → $before"
+        echo "[index] $after → $before"
         result=$(claude -p \
             "Call gmail_index_emails with query 'after:${after} before:${before}', index_all=true, skip_promotional=false. Report how many emails were indexed." \
             --allowedTools "mcp__claude_ai_Gmail_MCP__gmail_index_emails" \
@@ -66,85 +52,68 @@ PYEOF
     echo "[index] Indexing complete"
 }
 
-# ── Enrichment loop (runs in background) ────────────────────────────────────
+# ── Enrichment loop ───────────────────────────────────────────────────────────
 enrichment_loop() {
     echo "[enrich] Starting enrichment loop"
     local round=0
 
     while true; do
         round=$((round + 1))
-        echo "[enrich] Round $round [$(date '+%H:%M:%S')] fetching IDs"
+        echo "[enrich] Round $round [$(date '+%H:%M:%S')]"
 
+        # Fetch 50 IDs
         raw=$(claude -p \
-            "Call gmail_get_unenriched with max_results=500 and after_year=2017. Return ONLY a compact single-line JSON array of the email ids, no whitespace, no markdown. Example: [\"id1\",\"id2\"]" \
+            "Call gmail_get_unenriched with max_results=50 and after_year=2017. Return a single-line JSON array of just the ids. No markdown." \
             --allowedTools "mcp__claude_ai_Gmail_MCP__gmail_get_unenriched" \
             --permission-mode bypassPermissions \
             --model haiku \
-            --max-turns 5 \
+            --max-turns 3 \
             2>&1)
 
-        # Extract JSON array — handles both single-line and multi-line/markdown output
         ids_json=$(echo "$raw" | python3 2>/dev/null -c "
 import sys, re, json
-text = sys.stdin.read()
-m = re.search(r'\[.*?\]', text, re.DOTALL)
+m = re.search(r'\[.*?\]', sys.stdin.read(), re.DOTALL)
 if m:
     try: print(json.dumps(json.loads(m.group())))
     except: pass
 ")
 
         if [ -z "$ids_json" ] || [ "$ids_json" = "[]" ]; then
-            echo "[enrich] No unenriched emails right now, sleeping 30s..."
+            echo "[enrich] No emails, sleeping 30s..."
             sleep 30
             continue
         fi
 
-        chunks=$(python3 2>/dev/null -c "
+        # Split 50 IDs into 5 chunks of 10
+        readarray -t chunks < <(python3 2>/dev/null -c "
 import json, sys
 ids = json.loads(sys.argv[1])
-n = $WORKERS
-size = max(1, len(ids) // n)
-for i in range(n):
+size = max(1, len(ids) // $WORKERS)
+for i in range($WORKERS):
     chunk = ids[i*size:(i+1)*size]
-    if chunk:
-        print(json.dumps(chunk))
+    if chunk: print(json.dumps(chunk))
 " "$ids_json")
 
-        worker_id=0
-        while IFS= read -r chunk; do
-            worker_id=$((worker_id + 1))
+        # Launch one worker per chunk
+        for i in "${!chunks[@]}"; do
+            chunk="${chunks[$i]}"
+            prompt="${ENRICH_PROMPT/IDS_PLACEHOLDER/$chunk}"
             (
-                prompt=$(make_enrich_prompt "$chunk")
                 result=$(claude -p "$prompt" \
                     --allowedTools "mcp__claude_ai_Gmail_MCP__gmail_get_unenriched,mcp__claude_ai_Gmail_MCP__gmail_write_enrichment" \
                     --permission-mode bypassPermissions \
                     --model haiku \
                     --max-turns "$MAX_TURNS" \
                     2>&1)
-                echo "[enrich-$worker_id] $result"
+                echo "[enrich-$((i+1))] $result"
             ) &
-        done <<< "$chunks"
+        done
 
-        echo "[enrich] Round $round: waiting for $worker_id workers"
         wait
-        echo "[enrich] Round $round done [$(date '+%H:%M:%S')]"
+        echo "[enrich] Round $round done"
     done
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-echo "=== Gmail Index + Enrichment ==="
-echo "Enrich workers: $WORKERS | Emails per round: $((WORKERS * BATCH_SIZE))"
-echo "Started: $(date)"
-echo ""
-
 indexing_loop &
-INDEX_PID=$!
-
 enrichment_loop &
-ENRICH_PID=$!
-
-# Wait for indexing to finish; enrichment runs until interrupted
-wait $INDEX_PID
-echo ""
-echo "=== Indexing complete. Enrichment still running (Ctrl+C to stop) ==="
-wait $ENRICH_PID
+wait
