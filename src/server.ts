@@ -755,8 +755,15 @@ function createServer(): McpServer {
         .max(2100)
         .optional()
         .describe("Only return emails from this year or later (e.g. 2017)"),
+      before_year: z
+        .number()
+        .int()
+        .min(2000)
+        .max(2100)
+        .optional()
+        .describe("Only return emails before this year (e.g. 2020)"),
     },
-    async ({ max_results, query, after_year }, extra) => {
+    async ({ max_results, query, after_year, before_year }, extra) => {
       try {
         const email = getEmailFromExtra(extra);
 
@@ -776,6 +783,11 @@ function createServer(): McpServer {
         if (after_year) {
           sql += ` AND (regexp_match(e.date, '(20[0-9]{2}|19[0-9]{2})'))[1]::int >= $${params.length + 1}`;
           params.push(after_year);
+        }
+
+        if (before_year) {
+          sql += ` AND (regexp_match(e.date, '(20[0-9]{2}|19[0-9]{2})'))[1]::int < $${params.length + 1}`;
+          params.push(before_year);
         }
 
         sql += ` ORDER BY e.date DESC LIMIT $${params.length + 1}`;
