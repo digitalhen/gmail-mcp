@@ -741,15 +741,22 @@ function createServer(): McpServer {
       max_results: z
         .number()
         .min(1)
-        .max(50)
+        .max(500)
         .default(10)
         .describe("Maximum number of unenriched emails to return"),
       query: z
         .string()
         .optional()
         .describe("Optional search filter on subject/snippet"),
+      after_year: z
+        .number()
+        .int()
+        .min(2000)
+        .max(2100)
+        .optional()
+        .describe("Only return emails from this year or later (e.g. 2017)"),
     },
-    async ({ max_results, query }, extra) => {
+    async ({ max_results, query, after_year }, extra) => {
       try {
         const email = getEmailFromExtra(extra);
 
@@ -762,8 +769,13 @@ function createServer(): McpServer {
         const params: any[] = [email];
 
         if (query) {
-          sql += ` AND (e.subject ILIKE $2 OR e.snippet ILIKE $2)`;
+          sql += ` AND (e.subject ILIKE $${params.length + 1} OR e.snippet ILIKE $${params.length + 1})`;
           params.push(`%${query}%`);
+        }
+
+        if (after_year) {
+          sql += ` AND (regexp_match(e.date, '\\b(20[0-9]{2}|19[0-9]{2})\\b'))[1]::int >= $${params.length + 1}`;
+          params.push(after_year);
         }
 
         sql += ` ORDER BY e.date DESC LIMIT $${params.length + 1}`;
