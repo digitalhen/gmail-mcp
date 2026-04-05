@@ -27,7 +27,7 @@ import {
   getIndexStats,
   generateEmbedding,
 } from "./vector-store.js";
-import { enrichEmail, getEnrichmentStats } from "./enrichment.js";
+import { enrichEmail, getEnrichmentStats, canonicalizeEntity, isOwnerEntity } from "./enrichment.js";
 import {
   consolidateProjects,
   assignOrphans,
@@ -726,6 +726,250 @@ function createServer(): McpServer {
       } catch (error: any) {
         return {
           content: [{ type: "text", text: `Error enriching: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── External Enrichment Tools (for Claude Code classification) ───
+
+  server.tool(
+    "gmail_get_unenriched",
+    "Get indexed emails that have not yet been enriched/classified. Returns email ID, subject, from, to, date, and body text for external classification.",
+    {
+      max_results: z
+        .number()
+        .min(1)
+        .max(50)
+        .default(10)
+        .describe("Maximum number of unenriched emails to return"),
+      query: z
+        .string()
+        .optional()
+        .describe("Optional search filter on subject/snippet"),
+    },
+    async ({ max_results, query }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        let sql = `
+          SELECT e.id, e.subject, e.from_addr, e.to_addr, e.date, e.snippet,
+                 COALESCE(e.body_full, e.body_preview) as body
+          FROM emails e
+          LEFT JOIN email_enrichment ee ON ee.email_id = e.id
+          WHERE e.user_email = $1 AND ee.email_id IS NULL`;
+        const params: any[] = [email];
+
+        if (query) {
+          sql += ` AND (e.subject ILIKE $2 OR e.snippet ILIKE $2)`;
+          params.push(`%${query}%`);
+        }
+
+        sql += ` ORDER BY e.date DESC LIMIT $${params.length + 1}`;
+        params.push(max_results);
+
+        const result = await db.query(sql, params);
+
+        // Count total unenriched
+        const countResult = await db.query(
+          `SELECT COUNT(*) as count FROM emails e
+           LEFT JOIN email_enrichment ee ON ee.email_id = e.id
+           WHERE e.user_email = $1 AND ee.email_id IS NULL`,
+          [email]
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  total_unenriched: parseInt(countResult.rows[0].count),
+                  returned: result.rows.length,
+                  emails: result.rows.map((r: any) => ({
+                    id: r.id,
+                    subject: r.subject,
+                    from: r.from_addr,
+                    to: r.to_addr,
+                    date: r.date,
+                    body: r.body?.slice(0, 3000) || r.snippet || "",
+                  })),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "gmail_write_enrichment",
+    "Write enrichment/classification data for an email. Accepts the same JSON structure as the AI enrichment pipeline: intent_summary, life_project, entities, topics, key_dates, sentiment, email_type.",
+    {
+      email_id: z.string().describe("Gmail message ID to enrich"),
+      enrichment: z.object({
+        intent_summary: z.string().describe("One sentence: what is this email about?"),
+        life_project: z.string().nullable().describe("Broader project/initiative name, or null"),
+        entities: z.array(z.object({
+          name: z.string(),
+          type: z.enum(["person", "place", "organization", "flight", "document", "event", "institution"]),
+          role: z.enum(["sender", "recipient", "mentioned", "location", "destination", "provider", "subject"]),
+        })).default([]),
+        topics: z.array(z.string()).default([]).describe("Tags from: travel, coparenting, medical, legal, career, finance, technology, family, school, home, civic, insurance, food, shopping, media, passport, immigration"),
+        key_dates: z.array(z.object({
+          date: z.string().describe("YYYY-MM-DD"),
+          description: z.string(),
+        })).default([]),
+        sentiment: z.enum(["positive", "negative", "neutral", "urgent", "confrontational"]),
+        email_type: z.enum(["personal", "professional", "transactional", "promotional", "notification", "legal"]),
+      }),
+    },
+    async ({ email_id, enrichment }, extra) => {
+      try {
+        const email = getEmailFromExtra(extra);
+
+        // Verify this email belongs to the authenticated user
+        const emailCheck = await db.query(
+          "SELECT id FROM emails WHERE id = $1 AND user_email = $2",
+          [email_id, email]
+        );
+        if (emailCheck.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `Error: Email ${email_id} not found or not owned by ${email}` }],
+            isError: true,
+          };
+        }
+
+        // Filter out owner entities
+        const filteredEntities = (enrichment.entities || []).filter(
+          (e) => !isOwnerEntity(e.name)
+        );
+
+        await db.transaction(async (client) => {
+          // 1. Insert email_enrichment
+          await client.query(
+            `INSERT INTO email_enrichment (email_id, intent_summary, life_project, sentiment, email_type, is_transactional, is_promotional, enrichment_model, enrichment_raw)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (email_id) DO UPDATE SET
+               intent_summary = EXCLUDED.intent_summary,
+               life_project = EXCLUDED.life_project,
+               sentiment = EXCLUDED.sentiment,
+               email_type = EXCLUDED.email_type,
+               is_transactional = EXCLUDED.is_transactional,
+               is_promotional = EXCLUDED.is_promotional,
+               enrichment_model = EXCLUDED.enrichment_model,
+               enrichment_raw = EXCLUDED.enrichment_raw,
+               enriched_at = NOW()`,
+            [
+              email_id,
+              enrichment.intent_summary,
+              enrichment.life_project,
+              enrichment.sentiment,
+              enrichment.email_type,
+              enrichment.email_type === "transactional",
+              enrichment.email_type === "promotional",
+              "claude-code-manual",
+              JSON.stringify(enrichment),
+            ]
+          );
+
+          // 2. If promotional, flag in emails table
+          if (enrichment.email_type === "promotional") {
+            await client.query(
+              "UPDATE emails SET is_promotional = true WHERE id = $1",
+              [email_id]
+            );
+          }
+
+          // 3. Insert entities
+          for (const entity of filteredEntities) {
+            const canonicalName = canonicalizeEntity(entity.name, entity.type);
+
+            const entityResult = await client.query(
+              `INSERT INTO entities (name, entity_type, canonical_name)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (canonical_name, entity_type) DO UPDATE SET name = EXCLUDED.name
+               RETURNING id`,
+              [entity.name, entity.type, canonicalName]
+            );
+
+            await client.query(
+              `INSERT INTO email_entities (email_id, entity_id, role)
+               VALUES ($1, $2, $3)
+               ON CONFLICT DO NOTHING`,
+              [email_id, entityResult.rows[0].id, entity.role]
+            );
+          }
+
+          // 4. Insert tags
+          for (const tag of enrichment.topics || []) {
+            await client.query(
+              `INSERT INTO email_tags (email_id, tag)
+               VALUES ($1, $2)
+               ON CONFLICT DO NOTHING`,
+              [email_id, tag]
+            );
+          }
+
+          // 5. Insert key_dates
+          for (const kd of enrichment.key_dates || []) {
+            if (kd.date) {
+              await client.query(
+                `INSERT INTO email_dates (email_id, date, description)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING`,
+                [email_id, kd.date, kd.description]
+              );
+            }
+          }
+
+          // 6. Insert/update project
+          if (enrichment.life_project) {
+            const projectResult = await client.query(
+              `INSERT INTO projects (name, first_seen, last_activity)
+               VALUES ($1, NOW(), NOW())
+               ON CONFLICT (name) DO UPDATE SET last_activity = NOW()
+               RETURNING id`,
+              [enrichment.life_project]
+            );
+
+            await client.query(
+              `INSERT INTO email_projects (email_id, project_id, assigned_by)
+               VALUES ($1, $2, 'llm')
+               ON CONFLICT DO NOTHING`,
+              [email_id, projectResult.rows[0].id]
+            );
+          }
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                email_id,
+                intent: enrichment.intent_summary,
+                project: enrichment.life_project,
+                type: enrichment.email_type,
+                entities: filteredEntities.length,
+                tags: enrichment.topics?.length || 0,
+              }, null, 2),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error writing enrichment: ${error.message}` }],
           isError: true,
         };
       }

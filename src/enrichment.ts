@@ -107,12 +107,12 @@ const OWNER_NAMES = new Set([
   "digitalhen@gmail.com",
 ]);
 
-function canonicalizeEntity(name: string, _type: string): string {
+export function canonicalizeEntity(name: string, _type: string): string {
   let canonical = name.toLowerCase().trim();
   return ENTITY_MERGES[canonical] || canonical;
 }
 
-function isOwnerEntity(name: string): boolean {
+export function isOwnerEntity(name: string): boolean {
   return OWNER_NAMES.has(name.toLowerCase().trim());
 }
 
