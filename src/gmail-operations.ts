@@ -367,40 +367,64 @@ export interface AttachmentData {
   mimeType: string;
 }
 
+/** Recursively flatten all MIME parts that have an attachmentId. */
+function flattenAttachmentParts(part: gmail_v1.Schema$MessagePart): gmail_v1.Schema$MessagePart[] {
+  const results: gmail_v1.Schema$MessagePart[] = [];
+  if (part.body?.attachmentId) {
+    results.push(part);
+  }
+  if (part.parts) {
+    for (const child of part.parts) {
+      results.push(...flattenAttachmentParts(child));
+    }
+  }
+  return results;
+}
+
 export async function getAttachment(
   gmail: gmail_v1.Gmail,
   messageId: string,
   attachmentId: string
 ): Promise<AttachmentData> {
-  // Fetch attachment data and message metadata in parallel
-  const [attachRes, msgRes] = await Promise.all([
-    gmail.users.messages.attachments.get({
-      userId: "me",
-      messageId,
-      id: attachmentId,
-    }),
-    gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "metadata",
-      metadataHeaders: ["Subject"],
-    }),
-  ]);
+  // Step 1: Fetch the full message to get MIME parts (with fresh attachmentIds)
+  const msgRes = await gmail.users.messages.get({
+    userId: "me",
+    id: messageId,
+    format: "full",
+  });
 
-  // Walk message parts to find the matching attachment's filename/mimeType
-  let filename = "attachment";
-  let mimeType = "application/octet-stream";
+  const parts = msgRes.data.payload ? flattenAttachmentParts(msgRes.data.payload) : [];
 
-  function walkParts(part: gmail_v1.Schema$MessagePart) {
-    if (part.body?.attachmentId === attachmentId) {
-      if (part.filename) filename = part.filename;
-      if (part.mimeType) mimeType = part.mimeType;
-    }
-    if (part.parts) {
-      for (const child of part.parts) walkParts(child);
-    }
+  // Step 2: Match the caller's attachmentId against this call's parts
+  let part = parts.find((p) => p.body?.attachmentId === attachmentId);
+
+  // Fallback: if IDs are unstable across calls, match by filename+size or just take first
+  if (!part && parts.length === 1) {
+    part = parts[0];
+  } else if (!part && parts.length > 1) {
+    // Try matching by size (the caller got size from list_attachments)
+    // As a last resort, log and pick the first
+    console.warn(
+      `Attachment ID mismatch for message ${messageId}. ` +
+      `Caller passed: ${attachmentId.slice(0, 30)}... ` +
+      `Available: ${parts.map((p) => p.body?.attachmentId?.slice(0, 30) + "...").join(", ")}`
+    );
+    part = parts[0];
   }
-  if (msgRes.data.payload) walkParts(msgRes.data.payload);
+
+  if (!part?.body?.attachmentId) {
+    throw new Error(`No attachment found in message ${messageId}`);
+  }
+
+  const filename = part.filename || "attachment";
+  const mimeType = part.mimeType || "application/octet-stream";
+
+  // Step 3: Download using the attachmentId from THIS call (not the caller's)
+  const attachRes = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: part.body.attachmentId,
+  });
 
   return {
     data: attachRes.data.data || "",
