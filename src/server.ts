@@ -19,6 +19,7 @@ import {
   markAsUnread,
   trashEmail,
   getLabels,
+  getAttachment,
 } from "./gmail-operations.js";
 import {
   indexEmails,
@@ -408,6 +409,84 @@ function createServer(): McpServer {
         const labels = await getLabels(gmail);
         return {
           content: [{ type: "text", text: JSON.stringify(labels, null, 2) }],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── Attachment Tools ───
+
+  server.tool(
+    "list_attachments",
+    "List all attachments on a specific email message.",
+    {
+      message_id: z.string().describe("The Gmail message ID"),
+    },
+    async ({ message_id }, extra) => {
+      try {
+        const { gmail } = await getGmailFromExtra(extra);
+        const email = await getEmail(gmail, message_id);
+        if (email.attachments.length === 0) {
+          return {
+            content: [{ type: "text", text: "This email has no attachments." }],
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(email.attachments, null, 2) }],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "get_attachment",
+    "Download a specific attachment from an email. Returns the file content as base64-encoded data.",
+    {
+      message_id: z.string().describe("The Gmail message ID"),
+      attachment_id: z.string().describe("The attachment ID (from list_attachments)"),
+    },
+    async ({ message_id, attachment_id }, extra) => {
+      try {
+        const { gmail } = await getGmailFromExtra(extra);
+        // Get attachment metadata for the filename/mimeType
+        const email = await getEmail(gmail, message_id);
+        const info = email.attachments.find((a) => a.attachmentId === attachment_id);
+        const attachment = await getAttachment(gmail, message_id, attachment_id);
+
+        // Gmail returns base64url-encoded data; convert to standard base64
+        const base64Data = attachment.data.replace(/-/g, "+").replace(/_/g, "/");
+        const filename = info?.filename || "attachment";
+        const mimeType = info?.mimeType || "application/octet-stream";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                filename,
+                mimeType,
+                size: attachment.size,
+              }),
+            },
+            {
+              type: "resource",
+              resource: {
+                uri: `attachment://${message_id}/${filename}`,
+                mimeType,
+                blob: base64Data,
+              },
+            },
+          ],
         };
       } catch (error: any) {
         return {

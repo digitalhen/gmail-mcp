@@ -1,5 +1,12 @@
 import { gmail_v1 } from "googleapis";
 
+export interface AttachmentInfo {
+  attachmentId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface EmailMessage {
   id: string;
   threadId: string;
@@ -13,6 +20,7 @@ export interface EmailMessage {
   body: string;
   isUnread: boolean;
   labels: string[];
+  attachments: AttachmentInfo[];
 }
 
 function decodeBase64Url(data: string): string {
@@ -55,6 +63,30 @@ function extractBody(payload: gmail_v1.Schema$MessagePart | undefined): string {
   return "";
 }
 
+function extractAttachments(payload: gmail_v1.Schema$MessagePart | undefined): AttachmentInfo[] {
+  const attachments: AttachmentInfo[] = [];
+  if (!payload) return attachments;
+
+  function walk(part: gmail_v1.Schema$MessagePart) {
+    if (part.body?.attachmentId && part.filename) {
+      attachments.push({
+        attachmentId: part.body.attachmentId,
+        filename: part.filename,
+        mimeType: part.mimeType || "application/octet-stream",
+        size: part.body.size || 0,
+      });
+    }
+    if (part.parts) {
+      for (const child of part.parts) {
+        walk(child);
+      }
+    }
+  }
+
+  walk(payload);
+  return attachments;
+}
+
 function parseMessage(msg: gmail_v1.Schema$Message): EmailMessage {
   const headers = msg.payload?.headers;
   return {
@@ -70,6 +102,7 @@ function parseMessage(msg: gmail_v1.Schema$Message): EmailMessage {
     body: extractBody(msg.payload),
     isUnread: msg.labelIds?.includes("UNREAD") || false,
     labels: msg.labelIds || [],
+    attachments: extractAttachments(msg.payload),
   };
 }
 
@@ -325,4 +358,20 @@ export async function getLabels(
     name: l.name || "",
     type: l.type || "",
   }));
+}
+
+export async function getAttachment(
+  gmail: gmail_v1.Gmail,
+  messageId: string,
+  attachmentId: string
+): Promise<{ data: string; size: number }> {
+  const res = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachmentId,
+  });
+  return {
+    data: res.data.data || "",
+    size: res.data.size || 0,
+  };
 }
