@@ -44,9 +44,12 @@ import {
   enrichmentReview,
 } from "./corrections.js";
 import { indexAllEmails } from "./indexing.js";
+import { TempFileStore } from "./temp-file-store.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+const tempFileStore = new TempFileStore();
 
 const authProvider = new GmailOAuthProvider(BASE_URL);
 
@@ -450,34 +453,44 @@ function createServer(): McpServer {
 
   server.tool(
     "get_attachment",
-    "Download a specific attachment from an email. Returns the file content as base64-encoded data.",
+    "Fetch an attachment from an email. Returns metadata and a temporary download URL (valid 15 minutes). Use inline=true to get base64 data directly instead.",
     {
       message_id: z.string().describe("The Gmail message ID"),
       attachment_id: z.string().describe("The attachment ID (from list_attachments)"),
+      inline: z.boolean().default(false).describe("If true, return base64 data inline instead of a download URL"),
     },
-    async ({ message_id, attachment_id }, extra) => {
+    async ({ message_id, attachment_id, inline }, extra) => {
       try {
         const { gmail } = await getGmailFromExtra(extra);
-        // Get attachment metadata for the filename/mimeType
         const email = await getEmail(gmail, message_id);
         const info = email.attachments.find((a) => a.attachmentId === attachment_id);
         const attachment = await getAttachment(gmail, message_id, attachment_id);
 
-        // Gmail returns base64url-encoded data; convert to standard base64
-        const base64Data = attachment.data.replace(/-/g, "+").replace(/_/g, "/");
         const filename = info?.filename || "attachment";
         const mimeType = info?.mimeType || "application/octet-stream";
+
+        if (inline) {
+          const base64Data = attachment.data.replace(/-/g, "+").replace(/_/g, "/");
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ filename, mimeType, size: attachment.size, data: base64Data }),
+              },
+            ],
+          };
+        }
+
+        // Decode base64url from Gmail API into raw bytes
+        const fileBuffer = Buffer.from(attachment.data, "base64url");
+        const token = tempFileStore.store_file(fileBuffer, filename, mimeType);
+        const downloadUrl = `${BASE_URL}/downloads/${token}`;
 
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({
-                filename,
-                mimeType,
-                size: attachment.size,
-                data: base64Data,
-              }),
+              text: JSON.stringify({ filename, mimeType, size: attachment.size, downloadUrl }),
             },
           ],
         };
@@ -1968,6 +1981,19 @@ async function main() {
       return;
     }
     await transports[sessionId].handleRequest(req, res);
+  });
+
+  // Temporary attachment downloads (no auth — token is the secret)
+  app.get("/downloads/:token", (req, res) => {
+    const file = tempFileStore.retrieve(req.params.token);
+    if (!file) {
+      res.status(404).json({ error: "File not found or expired" });
+      return;
+    }
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Content-Disposition", `attachment; filename="${file.filename.replace(/"/g, '\\"')}"`);
+    res.setHeader("Content-Length", file.data.length);
+    res.send(file.data);
   });
 
   // Health check (no auth required)
