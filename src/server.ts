@@ -476,15 +476,8 @@ function createServer(): McpServer {
                 filename,
                 mimeType,
                 size: attachment.size,
+                data: base64Data,
               }),
-            },
-            {
-              type: "resource",
-              resource: {
-                uri: `attachment://${message_id}/${filename}`,
-                mimeType,
-                blob: base64Data,
-              },
             },
           ],
         };
