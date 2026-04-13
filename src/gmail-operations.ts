@@ -68,10 +68,10 @@ function extractAttachments(payload: gmail_v1.Schema$MessagePart | undefined): A
   if (!payload) return attachments;
 
   function walk(part: gmail_v1.Schema$MessagePart) {
-    if (part.body?.attachmentId && part.filename) {
+    if (part.body?.attachmentId) {
       attachments.push({
         attachmentId: part.body.attachmentId,
-        filename: part.filename,
+        filename: part.filename || `attachment-${attachments.length + 1}`,
         mimeType: part.mimeType || "application/octet-stream",
         size: part.body.size || 0,
       });
@@ -360,18 +360,52 @@ export async function getLabels(
   }));
 }
 
+export interface AttachmentData {
+  data: string;
+  size: number;
+  filename: string;
+  mimeType: string;
+}
+
 export async function getAttachment(
   gmail: gmail_v1.Gmail,
   messageId: string,
   attachmentId: string
-): Promise<{ data: string; size: number }> {
-  const res = await gmail.users.messages.attachments.get({
-    userId: "me",
-    messageId,
-    id: attachmentId,
-  });
+): Promise<AttachmentData> {
+  // Fetch attachment data and message metadata in parallel
+  const [attachRes, msgRes] = await Promise.all([
+    gmail.users.messages.attachments.get({
+      userId: "me",
+      messageId,
+      id: attachmentId,
+    }),
+    gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "metadata",
+      metadataHeaders: ["Subject"],
+    }),
+  ]);
+
+  // Walk message parts to find the matching attachment's filename/mimeType
+  let filename = "attachment";
+  let mimeType = "application/octet-stream";
+
+  function walkParts(part: gmail_v1.Schema$MessagePart) {
+    if (part.body?.attachmentId === attachmentId) {
+      if (part.filename) filename = part.filename;
+      if (part.mimeType) mimeType = part.mimeType;
+    }
+    if (part.parts) {
+      for (const child of part.parts) walkParts(child);
+    }
+  }
+  if (msgRes.data.payload) walkParts(msgRes.data.payload);
+
   return {
-    data: res.data.data || "",
-    size: res.data.size || 0,
+    data: attachRes.data.data || "",
+    size: attachRes.data.size || 0,
+    filename,
+    mimeType,
   };
 }

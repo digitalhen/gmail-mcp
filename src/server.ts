@@ -463,12 +463,8 @@ function createServer(): McpServer {
     async ({ message_id, attachment_id, inline }, extra) => {
       try {
         const { gmail } = await getGmailFromExtra(extra);
-        const email = await getEmail(gmail, message_id);
-        const info = email.attachments.find((a) => a.attachmentId === attachment_id);
         const attachment = await getAttachment(gmail, message_id, attachment_id);
-
-        const filename = info?.filename || "attachment";
-        const mimeType = info?.mimeType || "application/octet-stream";
+        const { filename, mimeType } = attachment;
 
         if (inline) {
           const base64Data = attachment.data.replace(/-/g, "+").replace(/_/g, "/");
@@ -515,12 +511,8 @@ function createServer(): McpServer {
     async ({ message_id, attachment_id, pages }, extra) => {
       try {
         const { gmail } = await getGmailFromExtra(extra);
-        const email = await getEmail(gmail, message_id);
-        const info = email.attachments.find((a) => a.attachmentId === attachment_id);
         const attachment = await getAttachment(gmail, message_id, attachment_id);
-
-        const filename = info?.filename || "attachment";
-        const mimeType = info?.mimeType || "application/octet-stream";
+        const { filename, mimeType } = attachment;
         const fileBuffer = Buffer.from(attachment.data, "base64url");
 
         const result = await extractText(fileBuffer, filename, mimeType, pages);
