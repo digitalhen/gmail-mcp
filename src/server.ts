@@ -45,6 +45,7 @@ import {
 } from "./corrections.js";
 import { indexAllEmails } from "./indexing.js";
 import { TempFileStore } from "./temp-file-store.js";
+import { extractText } from "./text-extraction.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -491,6 +492,52 @@ function createServer(): McpServer {
             {
               type: "text",
               text: JSON.stringify({ filename, mimeType, size: attachment.size, downloadUrl }),
+            },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "extract_attachment_text",
+    "Extract readable text from an email attachment (PDF, DOCX, TXT, HTML, images). For PDFs, optionally specify a page range. Returns extracted text content — much smaller than downloading the full file. For scanned PDFs, uses OCR if available.",
+    {
+      message_id: z.string().describe("The Gmail message ID"),
+      attachment_id: z.string().describe("The attachment ID (from list_attachments)"),
+      pages: z.string().optional().describe('Page range for PDFs, e.g. "1-5" or "1,3,7". Default: all pages.'),
+    },
+    async ({ message_id, attachment_id, pages }, extra) => {
+      try {
+        const { gmail } = await getGmailFromExtra(extra);
+        const email = await getEmail(gmail, message_id);
+        const info = email.attachments.find((a) => a.attachmentId === attachment_id);
+        const attachment = await getAttachment(gmail, message_id, attachment_id);
+
+        const filename = info?.filename || "attachment";
+        const mimeType = info?.mimeType || "application/octet-stream";
+        const fileBuffer = Buffer.from(attachment.data, "base64url");
+
+        const result = await extractText(fileBuffer, filename, mimeType, pages);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                filename,
+                mimeType,
+                size: attachment.size,
+                ...(result.totalPages !== undefined ? { totalPages: result.totalPages } : {}),
+                ...(result.extractedPages ? { extractedPages: result.extractedPages } : {}),
+                method: result.method,
+                text: result.text,
+              }, null, 2),
             },
           ],
         };

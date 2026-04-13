@@ -22,14 +22,17 @@
     "@anthropic-ai/sdk": "^0.78.0",
     "@huggingface/transformers": "^3.8.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "adm-zip": "^0.5.17",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "googleapis": "^171.4.0",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.20.0",
     "uuid": "^13.0.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
