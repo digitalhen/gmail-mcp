@@ -2035,6 +2035,67 @@ async function main() {
     res.send(file.data);
   });
 
+  // Personal REST search endpoint for the Chrome extension.
+  // Auth: single bearer token from PERSONAL_TOKEN env var.
+  // Scoped to a single user via PERSONAL_EMAIL env var.
+  const personalToken = process.env.PERSONAL_TOKEN;
+  const personalEmail = process.env.PERSONAL_EMAIL;
+
+  const searchCors = (req: express.Request, res: express.Response) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  };
+
+  app.options("/search", (req, res) => {
+    searchCors(req, res);
+    res.status(204).end();
+  });
+
+  app.get("/search", async (req, res) => {
+    searchCors(req, res);
+
+    if (!personalToken || !personalEmail) {
+      res.status(503).json({ error: "PERSONAL_TOKEN and PERSONAL_EMAIL env vars not configured" });
+      return;
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (provided !== personalToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!q) {
+      res.status(400).json({ error: "Missing query param 'q'" });
+      return;
+    }
+
+    const limitRaw = parseInt((req.query.limit as string) || "10", 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 50) : 10;
+
+    try {
+      const results = await semanticSearch(q, personalEmail, limit);
+      res.json(
+        results.map((r: any) => ({
+          messageId: r.id,
+          threadId: r.threadId,
+          subject: r.subject,
+          from: r.from,
+          date: r.date,
+          snippet: r.snippet,
+          score: Math.round(r.similarity * 1000) / 1000,
+        }))
+      );
+    } catch (error: any) {
+      console.error("Search error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Health check (no auth required)
   app.get("/health", async (_req, res) => {
     try {
