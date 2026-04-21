@@ -2077,10 +2077,20 @@ async function main() {
     const limitRaw = parseInt((req.query.limit as string) || "10", 10);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 50) : 10;
 
+    // Drop the weak tail of vector search — short queries over all-MiniLM-L6-v2
+    // routinely return filler past ~0.35 similarity. Tunable per-request.
+    const minScoreRaw = parseFloat((req.query.min_score as string) || "0.35");
+    const minScore = Number.isFinite(minScoreRaw) ? minScoreRaw : 0.35;
+
+    // Over-fetch so the filter doesn't starve the result list.
+    const fetchLimit = Math.min(limit * 3, 50);
+
     try {
-      const results = await semanticSearch(q, personalEmail, limit);
-      res.json(
-        results.map((r: any) => ({
+      const raw = await semanticSearch(q, personalEmail, fetchLimit);
+      const filtered = raw
+        .filter((r: any) => r.similarity >= minScore)
+        .slice(0, limit)
+        .map((r: any) => ({
           messageId: r.id,
           threadId: r.threadId,
           subject: r.subject,
@@ -2088,8 +2098,8 @@ async function main() {
           date: r.date,
           snippet: r.snippet,
           score: Math.round(r.similarity * 1000) / 1000,
-        }))
-      );
+        }));
+      res.json(filtered);
     } catch (error: any) {
       console.error("Search error:", error);
       res.status(500).json({ error: error.message });
