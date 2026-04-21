@@ -2082,24 +2082,47 @@ async function main() {
     const minScoreRaw = parseFloat((req.query.min_score as string) || "0.35");
     const minScore = Number.isFinite(minScoreRaw) ? minScoreRaw : 0.35;
 
-    // Over-fetch so the filter doesn't starve the result list.
-    const fetchLimit = Math.min(limit * 3, 50);
+    // Recency decay: final = similarity * 2^(-age_days / halfLife).
+    // halfLife = 180d means a 6-month-old email is weighted 0.5x.
+    // Pass decay_days=0 to disable.
+    const decayRaw = parseFloat((req.query.decay_days as string) || "180");
+    const halfLife = Number.isFinite(decayRaw) ? decayRaw : 180;
+
+    // Over-fetch so the filter + rerank has headroom.
+    const fetchLimit = Math.min(limit * 5, 50);
 
     try {
       const raw = await semanticSearch(q, personalEmail, fetchLimit);
-      const filtered = raw
+      const now = Date.now();
+      const reranked = raw
         .filter((r: any) => r.similarity >= minScore)
+        .map((r: any) => {
+          let decay = 1;
+          if (halfLife > 0 && r.date) {
+            const t = new Date(r.date).getTime();
+            if (Number.isFinite(t)) {
+              const ageDays = Math.max(0, (now - t) / 86_400_000);
+              decay = Math.pow(2, -ageDays / halfLife);
+            }
+          }
+          return {
+            r,
+            finalScore: r.similarity * decay,
+          };
+        })
+        .sort((a, b) => b.finalScore - a.finalScore)
         .slice(0, limit)
-        .map((r: any) => ({
+        .map(({ r, finalScore }) => ({
           messageId: r.id,
           threadId: r.threadId,
           subject: r.subject,
           from: r.from,
           date: r.date,
           snippet: r.snippet,
-          score: Math.round(r.similarity * 1000) / 1000,
+          score: Math.round(finalScore * 1000) / 1000,
+          similarity: Math.round(r.similarity * 1000) / 1000,
         }));
-      res.json(filtered);
+      res.json(reranked);
     } catch (error: any) {
       console.error("Search error:", error);
       res.status(500).json({ error: error.message });
