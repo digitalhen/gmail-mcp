@@ -2430,6 +2430,74 @@ async function main() {
     }
   });
 
+  // Admin: trigger Ollama to pull a model. Streams progress JSONL
+  // back. Useful when we need to swap to a new LLM during a long
+  // ingestion run without ssh'ing into the Mac.
+  app.post("/llm-pull", async (req, res) => {
+    searchCors(req, res);
+    if (!personalToken) {
+      res.status(503).json({ error: "PERSONAL_TOKEN env var not configured" });
+      return;
+    }
+    const authHeader = req.headers.authorization || "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (provided !== personalToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const model = (req.query.model as string) || "";
+    if (!model) {
+      res.status(400).json({ error: "Missing model query param" });
+      return;
+    }
+
+    const base = (process.env.OLLAMA_URL || "http://host.docker.internal:11434").replace(/\/+$/, "");
+
+    try {
+      const upstream = await fetch(`${base}/api/pull`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, stream: true }),
+      });
+      if (!upstream.ok || !upstream.body) {
+        const body = await upstream.text().catch(() => "");
+        res.status(upstream.status).json({ error: `Ollama pull failed: ${body.slice(0, 200)}` });
+        return;
+      }
+      res.setHeader("Content-Type", "application/x-ndjson");
+      // Stream upstream progress so the caller sees download status.
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let lastStatus = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        // Pull out the latest status for the log line.
+        for (const line of chunk.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.status && obj.status !== lastStatus) {
+              lastStatus = obj.status;
+              console.log(`[llm-pull] ${model}: ${obj.status}`);
+            }
+          } catch { /* keep streaming */ }
+        }
+        res.write(chunk);
+      }
+      res.end();
+    } catch (error: any) {
+      console.error("Pull error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message });
+      } else {
+        res.end();
+      }
+    }
+  });
+
   // Health check (no auth required)
   app.get("/health", async (_req, res) => {
     try {
