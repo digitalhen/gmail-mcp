@@ -2151,14 +2151,23 @@ async function main() {
     const provider = activeProvider();
     const batchRaw = parseInt((req.query.batch as string) || "50", 10);
     const batchSize = Number.isFinite(batchRaw) ? Math.min(Math.max(batchRaw, 1), 500) : 50;
+    const force = req.query.force === "1" || req.query.force === "true";
 
     try {
+      if (force) {
+        const cleared = await db.query(
+          `UPDATE emails SET ${col} = NULL WHERE user_email = $1 AND ${col} IS NOT NULL`,
+          [personalEmail]
+        );
+        console.log(`[reembed] force=1 cleared ${cleared.rowCount} existing vectors`);
+      }
+
       const pending = await db.query(
         `SELECT COUNT(*) AS count FROM emails WHERE user_email = $1 AND ${col} IS NULL`,
         [personalEmail]
       );
       const total = parseInt(pending.rows[0].count);
-      console.log(`[reembed] provider=${provider} col=${col} pending=${total}`);
+      console.log(`[reembed] provider=${provider} col=${col} pending=${total} force=${force}`);
 
       let done = 0;
       let failed = 0;
