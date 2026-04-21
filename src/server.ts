@@ -2164,6 +2164,8 @@ async function main() {
     const summarize = req.query.summarize === "1" || req.query.summarize === "true";
     const llmModel = (req.query.llm_model as string) || process.env.OLLAMA_LLM_MODEL || "qwen3.5:latest";
     const enrichmentTag = `local:${llmModel}`;
+    const concRaw = parseInt((req.query.concurrency as string) || "4", 10);
+    const concurrency = Number.isFinite(concRaw) ? Math.min(Math.max(concRaw, 1), 16) : 4;
 
     try {
       if (force && newDim) {
@@ -2227,6 +2229,67 @@ async function main() {
 
       let done = 0;
       let failed = 0;
+
+      const processRow = async (r: any) => {
+        try {
+          let embedText: string;
+
+          if (summarize) {
+            const summary = await summarizeEmail({
+              subject: r.subject || "",
+              from: r.from_addr || "",
+              snippet: r.snippet || "",
+              bodyPreview: r.body_preview || "",
+              date: r.date || "",
+            }, { model: llmModel });
+
+            await db.query(
+              `INSERT INTO email_enrichment
+                 (email_id, intent_summary, email_type, is_promotional, is_transactional, enrichment_model, enriched_at)
+               VALUES ($1, $2, $3, $4, $5, $6, NOW())
+               ON CONFLICT (email_id) DO UPDATE SET
+                 intent_summary = EXCLUDED.intent_summary,
+                 email_type = EXCLUDED.email_type,
+                 is_promotional = EXCLUDED.is_promotional,
+                 is_transactional = EXCLUDED.is_transactional,
+                 enrichment_model = EXCLUDED.enrichment_model,
+                 enriched_at = NOW()`,
+              [
+                r.id,
+                summary.summary,
+                summary.type,
+                summary.is_promotional,
+                summary.is_transactional,
+                enrichmentTag,
+              ]
+            );
+
+            await db.query(
+              `UPDATE emails SET is_promotional = $1 WHERE id = $2`,
+              [summary.is_promotional, r.id]
+            );
+
+            embedText = embeddingTextFromSummary(summary, {
+              from: r.from_addr || "",
+              subject: r.subject || "",
+            });
+          } else {
+            embedText = `${r.subject || ""} ${r.snippet || ""} ${(r.body_preview || "").slice(0, 1000)}`;
+          }
+
+          const vec = await generateEmbedding(embedText, "document");
+          const vectorStr = `[${vec.join(",")}]`;
+          await db.query(
+            `UPDATE emails SET ${col} = $1::vector WHERE id = $2`,
+            [vectorStr, r.id]
+          );
+          done++;
+        } catch (err: any) {
+          failed++;
+          console.error(`[reembed] ${r.id}: ${err.message}`);
+        }
+      };
+
       while (true) {
         const rows = await db.query(
           selectSql,
@@ -2235,74 +2298,26 @@ async function main() {
             : [personalEmail, batchSize]
         );
         if (rows.rows.length === 0) break;
-        for (const r of rows.rows) {
-          try {
-            let embedText: string;
 
-            if (summarize) {
-              const summary = await summarizeEmail({
-                subject: r.subject || "",
-                from: r.from_addr || "",
-                snippet: r.snippet || "",
-                bodyPreview: r.body_preview || "",
-                date: r.date || "",
-              }, { model: llmModel });
-
-              await db.query(
-                `INSERT INTO email_enrichment
-                   (email_id, intent_summary, email_type, is_promotional, is_transactional, enrichment_model, enriched_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                 ON CONFLICT (email_id) DO UPDATE SET
-                   intent_summary = EXCLUDED.intent_summary,
-                   email_type = EXCLUDED.email_type,
-                   is_promotional = EXCLUDED.is_promotional,
-                   is_transactional = EXCLUDED.is_transactional,
-                   enrichment_model = EXCLUDED.enrichment_model,
-                   enriched_at = NOW()`,
-                [
-                  r.id,
-                  summary.summary,
-                  summary.type,
-                  summary.is_promotional,
-                  summary.is_transactional,
-                  enrichmentTag,
-                ]
-              );
-
-              // Also mirror the promotional flag onto emails for the
-              // query-path filters that live there.
-              await db.query(
-                `UPDATE emails SET is_promotional = $1 WHERE id = $2`,
-                [summary.is_promotional, r.id]
-              );
-
-              embedText = embeddingTextFromSummary(summary, {
-                from: r.from_addr || "",
-                subject: r.subject || "",
-              });
-            } else {
-              embedText = `${r.subject || ""} ${r.snippet || ""} ${(r.body_preview || "").slice(0, 1000)}`;
-            }
-
-            const vec = await generateEmbedding(embedText, "document");
-            const vectorStr = `[${vec.join(",")}]`;
-            await db.query(
-              `UPDATE emails SET ${col} = $1::vector WHERE id = $2`,
-              [vectorStr, r.id]
-            );
-            done++;
-          } catch (err: any) {
-            failed++;
-            console.error(`[reembed] ${r.id}: ${err.message}`);
+        // Worker-pool fanout: `concurrency` workers pull from the
+        // shared batch in lockstep so we keep Ollama saturated.
+        let cursor = 0;
+        const workers = Array.from({ length: concurrency }, async () => {
+          while (true) {
+            const i = cursor++;
+            if (i >= rows.rows.length) return;
+            await processRow(rows.rows[i]);
           }
-        }
-        console.log(`[reembed] progress ${done}/${total} (${failed} failed)`);
+        });
+        await Promise.all(workers);
+
+        console.log(`[reembed] progress ${done}/${total} (${failed} failed) conc=${concurrency}`);
       }
 
       // Create HNSW index if this was the first successful pass.
       await db.createHnswIndexIfNeeded();
 
-      res.json({ provider, column: col, summarize, model: summarize ? llmModel : null, total, done, failed });
+      res.json({ provider, column: col, summarize, model: summarize ? llmModel : null, concurrency, total, done, failed });
     } catch (error: any) {
       console.error("Reembed error:", error);
       res.status(500).json({ error: error.message });
