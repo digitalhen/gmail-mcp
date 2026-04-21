@@ -188,6 +188,84 @@ export async function indexEmails(
   return { indexed, skipped };
 }
 
+export async function hybridSearch(
+  queryText: string,
+  userEmail: string,
+  limit: number,
+  rrfK = 60
+): Promise<any[]> {
+  const embedding = await generateEmbedding(queryText, "query");
+  const vectorStr = `[${embedding.join(",")}]`;
+  const col = activeEmbeddingColumn();
+  const fetchLimit = Math.min(limit * 5, 100);
+
+  const sql = `
+    WITH q AS (SELECT websearch_to_tsquery('english', $4) AS tsq),
+    vec AS (
+      SELECT id,
+             ROW_NUMBER() OVER (ORDER BY ${col} <=> $1::vector) AS rank,
+             1 - (${col} <=> $1::vector) AS similarity
+      FROM emails
+      WHERE user_email = $2 AND ${col} IS NOT NULL
+      ORDER BY ${col} <=> $1::vector
+      LIMIT $3
+    ),
+    kw AS (
+      SELECT e.id,
+             ROW_NUMBER() OVER (ORDER BY ts_rank_cd(e.search_text, q.tsq) DESC) AS rank,
+             ts_rank_cd(e.search_text, q.tsq) AS fts_score
+      FROM emails e, q
+      WHERE e.user_email = $2
+        AND q.tsq IS NOT NULL
+        AND e.search_text @@ q.tsq
+      ORDER BY ts_rank_cd(e.search_text, q.tsq) DESC
+      LIMIT $3
+    ),
+    scored AS (
+      SELECT COALESCE(v.id, k.id) AS id,
+             COALESCE(1.0 / ($5 + v.rank), 0) + COALESCE(1.0 / ($5 + k.rank), 0) AS rrf,
+             v.similarity,
+             k.fts_score,
+             v.rank AS vec_rank,
+             k.rank AS kw_rank
+      FROM vec v
+      FULL OUTER JOIN kw k ON v.id = k.id
+    )
+    SELECT e.id, e.thread_id, e.subject, e.from_addr, e.to_addr, e.date, e.snippet,
+           e.body_preview,
+           s.rrf, s.similarity, s.fts_score, s.vec_rank, s.kw_rank
+    FROM scored s
+    JOIN emails e ON e.id = s.id
+    ORDER BY s.rrf DESC
+    LIMIT $6
+  `;
+
+  const result = await db.query(sql, [
+    vectorStr,
+    userEmail,
+    fetchLimit,
+    queryText,
+    rrfK,
+    limit,
+  ]);
+
+  return result.rows.map((r: any) => ({
+    id: r.id,
+    threadId: r.thread_id,
+    subject: r.subject,
+    from: r.from_addr,
+    to: r.to_addr,
+    date: r.date,
+    snippet: r.snippet,
+    bodyPreview: r.body_preview,
+    rrf: parseFloat(r.rrf),
+    similarity: r.similarity !== null ? parseFloat(r.similarity) : null,
+    ftsScore: r.fts_score !== null ? parseFloat(r.fts_score) : null,
+    vecRank: r.vec_rank !== null ? parseInt(r.vec_rank) : null,
+    kwRank: r.kw_rank !== null ? parseInt(r.kw_rank) : null,
+  }));
+}
+
 export async function semanticSearch(
   queryText: string,
   userEmail: string,

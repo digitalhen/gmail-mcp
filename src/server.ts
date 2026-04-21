@@ -24,6 +24,7 @@ import {
 import {
   indexEmails,
   semanticSearch,
+  hybridSearch,
   findSimilar,
   getIndexStats,
   generateEmbedding,
@@ -2079,25 +2080,16 @@ async function main() {
     const limitRaw = parseInt((req.query.limit as string) || "10", 10);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 50) : 10;
 
-    // Drop the weak tail of vector search — short queries over all-MiniLM-L6-v2
-    // routinely return filler past ~0.35 similarity. Tunable per-request.
-    const minScoreRaw = parseFloat((req.query.min_score as string) || "0.35");
-    const minScore = Number.isFinite(minScoreRaw) ? minScoreRaw : 0.35;
-
-    // Recency decay: final = similarity * 2^(-age_days / halfLife).
+    // Recency decay: final = rrf * 2^(-age_days / halfLife).
     // halfLife = 180d means a 6-month-old email is weighted 0.5x.
     // Pass decay_days=0 to disable.
     const decayRaw = parseFloat((req.query.decay_days as string) || "180");
     const halfLife = Number.isFinite(decayRaw) ? decayRaw : 180;
 
-    // Over-fetch so the filter + rerank has headroom.
-    const fetchLimit = Math.min(limit * 5, 50);
-
     try {
-      const raw = await semanticSearch(q, personalEmail, fetchLimit);
+      const raw = await hybridSearch(q, personalEmail, limit);
       const now = Date.now();
       const reranked = raw
-        .filter((r: any) => r.similarity >= minScore)
         .map((r: any) => {
           let decay = 1;
           if (halfLife > 0 && r.date) {
@@ -2107,13 +2099,9 @@ async function main() {
               decay = Math.pow(2, -ageDays / halfLife);
             }
           }
-          return {
-            r,
-            finalScore: r.similarity * decay,
-          };
+          return { r, finalScore: r.rrf * decay };
         })
         .sort((a, b) => b.finalScore - a.finalScore)
-        .slice(0, limit)
         .map(({ r, finalScore }) => ({
           messageId: r.id,
           threadId: r.threadId,
@@ -2121,8 +2109,12 @@ async function main() {
           from: r.from,
           date: r.date,
           snippet: r.snippet,
-          score: Math.round(finalScore * 1000) / 1000,
-          similarity: Math.round(r.similarity * 1000) / 1000,
+          score: Math.round(finalScore * 10000) / 10000,
+          rrf: Math.round(r.rrf * 10000) / 10000,
+          similarity: r.similarity !== null ? Math.round(r.similarity * 1000) / 1000 : null,
+          ftsScore: r.ftsScore !== null ? Math.round(r.ftsScore * 10000) / 10000 : null,
+          vecRank: r.vecRank,
+          kwRank: r.kwRank,
         }));
       res.json(reranked);
     } catch (error: any) {

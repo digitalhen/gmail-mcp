@@ -272,6 +272,15 @@ class Database {
       -- Coexists with the original 384-dim column so we can flip providers
       -- via the EMBEDDING_PROVIDER flag without losing the other index.
       ALTER TABLE emails ADD COLUMN IF NOT EXISTS embedding_ollama vector(768);
+
+      -- Keyword search column for hybrid retrieval. Generated from
+      -- subject + snippet only (body_preview contains HTML tags that
+      -- would pollute the lexicon).
+      ALTER TABLE emails ADD COLUMN IF NOT EXISTS search_text tsvector
+        GENERATED ALWAYS AS (
+          to_tsvector('english', coalesce(subject, '') || ' ' || coalesce(snippet, ''))
+        ) STORED;
+      CREATE INDEX IF NOT EXISTS idx_emails_search_text ON emails USING GIN (search_text);
     `);
   }
 }
