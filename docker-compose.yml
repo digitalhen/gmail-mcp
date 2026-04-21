@@ -31,6 +31,8 @@ services:
       GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID}"
       GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      PERSONAL_TOKEN: "${PERSONAL_TOKEN}"
+      PERSONAL_EMAIL: "${PERSONAL_EMAIL}"
     depends_on:
       db:
         condition: service_healthy
