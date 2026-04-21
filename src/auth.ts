@@ -433,4 +433,57 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
     return { gmail, email: row.user_email };
   }
+
+  // Same shape as getGmailServiceForToken but keyed by user_email,
+  // for admin/batch endpoints that don't have an MCP access token.
+  async getGmailServiceForEmail(email: string): Promise<{
+    gmail: ReturnType<typeof google.gmail>;
+    email: string;
+  }> {
+    const result = await db.query(
+      `SELECT * FROM oauth_tokens
+       WHERE user_email = $1 AND google_refresh_token IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email]
+    );
+    if (result.rows.length === 0) {
+      throw new Error(
+        `No stored Google refresh token for ${email}. Connect this account via the MCP OAuth flow first.`
+      );
+    }
+
+    const row = result.rows[0];
+    const oauth2Client = this.createGoogleOAuth2Client();
+    oauth2Client.setCredentials({
+      access_token: row.google_access_token,
+      refresh_token: row.google_refresh_token,
+      expiry_date: row.google_expiry_date
+        ? Number(row.google_expiry_date)
+        : undefined,
+    });
+
+    oauth2Client.on("tokens", async (newTokens) => {
+      try {
+        await db.query(
+          `UPDATE oauth_tokens
+           SET google_access_token = COALESCE($1, google_access_token),
+               google_refresh_token = COALESCE($2, google_refresh_token),
+               google_expiry_date = COALESCE($3, google_expiry_date)
+           WHERE user_email = $4`,
+          [
+            newTokens.access_token || null,
+            newTokens.refresh_token || null,
+            newTokens.expiry_date || null,
+            email,
+          ]
+        );
+      } catch (err) {
+        console.error("[Auth] Failed to persist refreshed Google tokens:", err);
+      }
+    });
+
+    const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+    return { gmail, email };
+  }
 }

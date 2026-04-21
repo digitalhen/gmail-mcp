@@ -2309,6 +2309,112 @@ async function main() {
     }
   });
 
+  // Admin: kick off historical Gmail indexing using stored OAuth tokens.
+  // Uses Gmail search syntax via ?q= (default: "newer_than:10y").
+  // Fire-and-forget: Cloudflare will cut at ~100s but the server
+  // keeps paginating. Re-call to resume (indexEmail dedupes by id).
+  app.post("/index", async (req, res) => {
+    searchCors(req, res);
+    if (!personalToken || !personalEmail) {
+      res.status(503).json({ error: "PERSONAL_TOKEN and PERSONAL_EMAIL env vars not configured" });
+      return;
+    }
+    const authHeader = req.headers.authorization || "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (provided !== personalToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const q = (req.query.q as string) || "newer_than:10y";
+    const batchRaw = parseInt((req.query.batch as string) || "100", 10);
+    const batchSize = Number.isFinite(batchRaw) ? Math.min(Math.max(batchRaw, 1), 500) : 100;
+
+    console.log(`[index] query='${q}' batch=${batchSize}`);
+
+    try {
+      const { gmail } = await authProvider.getGmailServiceForEmail(personalEmail);
+      const stats = await indexAllEmails({
+        gmail,
+        userEmail: personalEmail,
+        query: q,
+        batchSize,
+        skipPromotional: false,
+        enrich: false,
+        onProgress: (indexed, skipped, total) => {
+          console.log(`[index] progress indexed=${indexed} skipped=${skipped} seen=${total}`);
+        },
+      });
+      console.log(`[index] done ${JSON.stringify(stats)}`);
+      res.json({ query: q, ...stats });
+    } catch (error: any) {
+      console.error("Index error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Admin: progress visibility for the whole pipeline.
+  app.get("/status", async (req, res) => {
+    searchCors(req, res);
+    if (!personalToken || !personalEmail) {
+      res.status(503).json({ error: "PERSONAL_TOKEN and PERSONAL_EMAIL env vars not configured" });
+      return;
+    }
+    const authHeader = req.headers.authorization || "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (provided !== personalToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    try {
+      const col = activeEmbeddingColumn();
+      const total = await db.query(
+        `SELECT COUNT(*)::int AS c FROM emails WHERE user_email = $1`,
+        [personalEmail]
+      );
+      const embedded = await db.query(
+        `SELECT COUNT(*)::int AS c FROM emails WHERE user_email = $1 AND ${col} IS NOT NULL`,
+        [personalEmail]
+      );
+      const summarized = await db.query(
+        `SELECT enrichment_model, COUNT(*)::int AS c
+         FROM email_enrichment en
+         JOIN emails e ON e.id = en.email_id
+         WHERE e.user_email = $1
+         GROUP BY enrichment_model
+         ORDER BY c DESC`,
+        [personalEmail]
+      );
+      const dates = await db.query(
+        `SELECT MIN(date) AS oldest, MAX(date) AS newest
+         FROM emails WHERE user_email = $1`,
+        [personalEmail]
+      );
+      const sampleSummaries = await db.query(
+        `SELECT e.subject, en.email_type, en.intent_summary, en.is_promotional
+         FROM email_enrichment en
+         JOIN emails e ON e.id = en.email_id
+         WHERE e.user_email = $1 AND en.enrichment_model LIKE 'local:%'
+         ORDER BY en.enriched_at DESC
+         LIMIT 5`,
+        [personalEmail]
+      );
+      res.json({
+        provider: activeProvider(),
+        column: col,
+        totalEmails: total.rows[0].c,
+        embedded: embedded.rows[0].c,
+        summarizedByModel: summarized.rows,
+        dateRange: dates.rows[0],
+        recentSummaries: sampleSummaries.rows,
+      });
+    } catch (error: any) {
+      console.error("Status error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Health check (no auth required)
   app.get("/health", async (_req, res) => {
     try {
