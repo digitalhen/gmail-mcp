@@ -53,7 +53,11 @@ export async function summarizeEmail(
 ): Promise<EmailSummary> {
   const url = (opts.url || process.env.OLLAMA_URL || "http://host.docker.internal:11434").replace(/\/+$/, "");
   const model = opts.model || process.env.OLLAMA_LLM_MODEL || "qwen3.5:latest";
-  const timeoutMs = opts.timeoutMs ?? 60_000;
+  // Cold-loading a 9B model takes 30-60s on its own; bulk ingestion
+  // can also contend with the embedding model. 5 minutes gives enough
+  // slack for load + long bodies without hanging forever.
+  const envTimeout = parseInt(process.env.OLLAMA_LLM_TIMEOUT_MS || "", 10);
+  const timeoutMs = opts.timeoutMs ?? (Number.isFinite(envTimeout) ? envTimeout : 300_000);
 
   const bodySnippet = (email.bodyPreview || "").slice(0, 1500);
 
@@ -78,6 +82,9 @@ Body: ${bodySnippet}`;
         ],
         stream: false,
         format: "json",
+        // Keep the model resident between calls so we don't pay the
+        // cold-load on every email during a bulk pass.
+        keep_alive: "30m",
         options: { temperature: 0 },
       }),
       signal: ctrl.signal,
