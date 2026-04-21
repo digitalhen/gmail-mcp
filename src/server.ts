@@ -49,6 +49,7 @@ import {
 import { indexAllEmails } from "./indexing.js";
 import { TempFileStore } from "./temp-file-store.js";
 import { extractText } from "./text-extraction.js";
+import { summarizeEmail, embeddingTextFromSummary } from "./summary.js";
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -2156,6 +2157,14 @@ async function main() {
     const newDim = Number.isFinite(dimRaw) && dimRaw > 0 ? dimRaw : null;
     const indexName = col === "embedding_ollama" ? "idx_emails_embedding_ollama" : "idx_emails_embedding";
 
+    // LLM-summary mode: classify + rewrite each email through a local
+    // Ollama LLM, store the summary in email_enrichment, then embed the
+    // SUMMARY (not the raw body). This decouples the embedding from
+    // vocabulary overlap so marketing emails don't outrank confirmations.
+    const summarize = req.query.summarize === "1" || req.query.summarize === "true";
+    const llmModel = (req.query.llm_model as string) || process.env.OLLAMA_LLM_MODEL || "qwen3.5:latest";
+    const enrichmentTag = `local:${llmModel}`;
+
     try {
       if (force && newDim) {
         // Resize the column — destroys all vectors in it, which is fine
@@ -2174,28 +2183,108 @@ async function main() {
         console.log(`[reembed] force=1 cleared ${cleared.rowCount} existing vectors`);
       }
 
-      const pending = await db.query(
-        `SELECT COUNT(*) AS count FROM emails WHERE user_email = $1 AND ${col} IS NULL`,
-        [personalEmail]
-      );
+      // Decide which rows need work.
+      // Without summarize: every row whose active embedding is null.
+      // With summarize: rows missing a summary by this model, OR with
+      //   null embedding. force=1 reprocesses everything regardless.
+      const selectSql = summarize
+        ? (force
+          ? `SELECT e.id, e.subject, e.snippet, e.body_preview, e.from_addr, e.date
+             FROM emails e WHERE e.user_email = $1 LIMIT $2`
+          : `SELECT e.id, e.subject, e.snippet, e.body_preview, e.from_addr, e.date
+             FROM emails e
+             LEFT JOIN email_enrichment en ON en.email_id = e.id
+             WHERE e.user_email = $1
+               AND (en.enrichment_model IS NULL
+                    OR en.enrichment_model != $3
+                    OR e.${col} IS NULL)
+             LIMIT $2`)
+        : `SELECT id, subject, snippet, body_preview, from_addr, date
+           FROM emails
+           WHERE user_email = $1 AND ${col} IS NULL
+           LIMIT $2`;
+
+      const countSql = summarize
+        ? (force
+          ? `SELECT COUNT(*) AS count FROM emails WHERE user_email = $1`
+          : `SELECT COUNT(*) AS count FROM emails e
+             LEFT JOIN email_enrichment en ON en.email_id = e.id
+             WHERE e.user_email = $1
+               AND (en.enrichment_model IS NULL
+                    OR en.enrichment_model != $2
+                    OR e.${col} IS NULL)`)
+        : `SELECT COUNT(*) AS count FROM emails
+           WHERE user_email = $1 AND ${col} IS NULL`;
+
+      const countParams = summarize
+        ? (force ? [personalEmail] : [personalEmail, enrichmentTag])
+        : [personalEmail];
+      const pending = await db.query(countSql, countParams);
       const total = parseInt(pending.rows[0].count);
-      console.log(`[reembed] provider=${provider} col=${col} pending=${total} force=${force}`);
+      console.log(
+        `[reembed] provider=${provider} col=${col} summarize=${summarize} model=${summarize ? llmModel : "—"} pending=${total} force=${force}`
+      );
 
       let done = 0;
       let failed = 0;
       while (true) {
         const rows = await db.query(
-          `SELECT id, subject, snippet, body_preview
-           FROM emails
-           WHERE user_email = $1 AND ${col} IS NULL
-           LIMIT $2`,
-          [personalEmail, batchSize]
+          selectSql,
+          summarize && !force
+            ? [personalEmail, batchSize, enrichmentTag]
+            : [personalEmail, batchSize]
         );
         if (rows.rows.length === 0) break;
         for (const r of rows.rows) {
-          const text = `${r.subject || ""} ${r.snippet || ""} ${(r.body_preview || "").slice(0, 1000)}`;
           try {
-            const vec = await generateEmbedding(text);
+            let embedText: string;
+
+            if (summarize) {
+              const summary = await summarizeEmail({
+                subject: r.subject || "",
+                from: r.from_addr || "",
+                snippet: r.snippet || "",
+                bodyPreview: r.body_preview || "",
+                date: r.date || "",
+              }, { model: llmModel });
+
+              await db.query(
+                `INSERT INTO email_enrichment
+                   (email_id, intent_summary, email_type, is_promotional, is_transactional, enrichment_model, enriched_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                 ON CONFLICT (email_id) DO UPDATE SET
+                   intent_summary = EXCLUDED.intent_summary,
+                   email_type = EXCLUDED.email_type,
+                   is_promotional = EXCLUDED.is_promotional,
+                   is_transactional = EXCLUDED.is_transactional,
+                   enrichment_model = EXCLUDED.enrichment_model,
+                   enriched_at = NOW()`,
+                [
+                  r.id,
+                  summary.summary,
+                  summary.type,
+                  summary.is_promotional,
+                  summary.is_transactional,
+                  enrichmentTag,
+                ]
+              );
+
+              // Also mirror the promotional flag onto emails for the
+              // query-path filters that live there.
+              await db.query(
+                `UPDATE emails SET is_promotional = $1 WHERE id = $2`,
+                [summary.is_promotional, r.id]
+              );
+
+              embedText = embeddingTextFromSummary(summary, {
+                from: r.from_addr || "",
+                subject: r.subject || "",
+              });
+            } else {
+              embedText = `${r.subject || ""} ${r.snippet || ""} ${(r.body_preview || "").slice(0, 1000)}`;
+            }
+
+            const vec = await generateEmbedding(embedText, "document");
             const vectorStr = `[${vec.join(",")}]`;
             await db.query(
               `UPDATE emails SET ${col} = $1::vector WHERE id = $2`,
@@ -2213,7 +2302,7 @@ async function main() {
       // Create HNSW index if this was the first successful pass.
       await db.createHnswIndexIfNeeded();
 
-      res.json({ provider, column: col, total, done, failed });
+      res.json({ provider, column: col, summarize, model: summarize ? llmModel : null, total, done, failed });
     } catch (error: any) {
       console.error("Reembed error:", error);
       res.status(500).json({ error: error.message });

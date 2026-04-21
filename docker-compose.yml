@@ -36,6 +36,7 @@ services:
       EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-transformers}"
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
       OLLAMA_EMBED_MODEL: "${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+      OLLAMA_LLM_MODEL: "${OLLAMA_LLM_MODEL:-qwen3.5:latest}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
