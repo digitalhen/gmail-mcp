@@ -2086,8 +2086,16 @@ async function main() {
     const decayRaw = parseFloat((req.query.decay_days as string) || "180");
     const halfLife = Number.isFinite(decayRaw) ? decayRaw : 180;
 
+    // Hybrid weights. Vector should dominate so keyword acts as a
+    // re-ranker over vector candidates, not a separate channel that
+    // can lift single-mention keyword spam.
+    const vwRaw = parseFloat((req.query.vec_weight as string) || "0.7");
+    const kwRaw = parseFloat((req.query.kw_weight as string) || "0.3");
+    const vecWeight = Number.isFinite(vwRaw) ? vwRaw : 0.7;
+    const kwWeight = Number.isFinite(kwRaw) ? kwRaw : 0.3;
+
     try {
-      const raw = await hybridSearch(q, personalEmail, limit);
+      const raw = await hybridSearch(q, personalEmail, limit, { vecWeight, kwWeight });
       const now = Date.now();
       const reranked = raw
         .map((r: any) => {

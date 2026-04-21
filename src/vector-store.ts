@@ -192,8 +192,11 @@ export async function hybridSearch(
   queryText: string,
   userEmail: string,
   limit: number,
-  rrfK = 60
+  opts: { rrfK?: number; vecWeight?: number; kwWeight?: number } = {}
 ): Promise<any[]> {
+  const rrfK = opts.rrfK ?? 60;
+  const vecWeight = opts.vecWeight ?? 0.7;
+  const kwWeight = opts.kwWeight ?? 0.3;
   const embedding = await generateEmbedding(queryText, "query");
   const vectorStr = `[${embedding.join(",")}]`;
   const col = activeEmbeddingColumn();
@@ -223,7 +226,7 @@ export async function hybridSearch(
     ),
     scored AS (
       SELECT COALESCE(v.id, k.id) AS id,
-             COALESCE(1.0 / ($5 + v.rank), 0) + COALESCE(1.0 / ($5 + k.rank), 0) AS rrf,
+             COALESCE($7 * 1.0 / ($5 + v.rank), 0) + COALESCE($8 * 1.0 / ($5 + k.rank), 0) AS rrf,
              v.similarity,
              k.fts_score,
              v.rank AS vec_rank,
@@ -247,6 +250,8 @@ export async function hybridSearch(
     queryText,
     rrfK,
     limit,
+    vecWeight,
+    kwWeight,
   ]);
 
   return result.rows.map((r: any) => ({
