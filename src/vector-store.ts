@@ -2,6 +2,17 @@ import { db } from "./db.js";
 import { createHash } from "crypto";
 import { stripHtml } from "./enrichment.js";
 
+type Provider = "transformers" | "ollama";
+
+export function activeProvider(): Provider {
+  const p = (process.env.EMBEDDING_PROVIDER || "transformers").toLowerCase();
+  return p === "ollama" ? "ollama" : "transformers";
+}
+
+export function activeEmbeddingColumn(): "embedding" | "embedding_ollama" {
+  return activeProvider() === "ollama" ? "embedding_ollama" : "embedding";
+}
+
 let pipelineFn: any;
 let embeddingPipeline: any;
 
@@ -21,10 +32,40 @@ async function getEmbeddingPipeline() {
   return embeddingPipeline;
 }
 
-export async function generateEmbedding(text: string): Promise<number[]> {
+async function embedTransformers(text: string): Promise<number[]> {
   const extractor = await getEmbeddingPipeline();
   const output = await extractor(text, { pooling: "mean", normalize: true });
   return Array.from(output.data as Float32Array);
+}
+
+async function embedOllama(text: string): Promise<number[]> {
+  const base = (process.env.OLLAMA_URL || "http://host.docker.internal:11434").replace(/\/+$/, "");
+  const model = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
+  const res = await fetch(`${base}/api/embed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, input: text }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Ollama embed ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { embeddings?: number[][]; embedding?: number[] };
+  const vec = data.embeddings?.[0] || data.embedding;
+  if (!vec || !Array.isArray(vec)) {
+    throw new Error("Ollama embed: empty or malformed response");
+  }
+  // Normalize to unit length so cosine distance matches our MiniLM setup.
+  let norm = 0;
+  for (const v of vec) norm += v * v;
+  norm = Math.sqrt(norm) || 1;
+  return vec.map((v) => v / norm);
+}
+
+export async function generateEmbedding(text: string): Promise<number[]> {
+  return activeProvider() === "ollama"
+    ? embedOllama(text)
+    : embedTransformers(text);
 }
 
 export function computeBodyHash(
@@ -69,11 +110,11 @@ export async function indexEmail(record: {
   const cleanBody = stripHtml(record.bodyPreview);
   const text = `${record.subject} ${record.snippet} ${cleanBody.slice(0, 1000)}`;
   const embedding = await generateEmbedding(text);
-
   const vectorStr = `[${embedding.join(",")}]`;
+  const col = activeEmbeddingColumn();
 
   await db.query(
-    `INSERT INTO emails (id, user_email, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, body_full, body_hash, embedding)
+    `INSERT INTO emails (id, user_email, thread_id, subject, from_addr, to_addr, date, snippet, body_preview, body_full, body_hash, ${col})
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (id) DO NOTHING`,
     [
@@ -144,13 +185,14 @@ export async function semanticSearch(
 ): Promise<any[]> {
   const embedding = await generateEmbedding(queryText);
   const vectorStr = `[${embedding.join(",")}]`;
+  const col = activeEmbeddingColumn();
 
   const result = await db.query(
     `SELECT id, thread_id, subject, from_addr, to_addr, date, snippet, body_preview,
-            1 - (embedding <=> $1::vector) as similarity
+            1 - (${col} <=> $1::vector) as similarity
      FROM emails
-     WHERE user_email = $2
-     ORDER BY embedding <=> $1::vector
+     WHERE user_email = $2 AND ${col} IS NOT NULL
+     ORDER BY ${col} <=> $1::vector
      LIMIT $3`,
     [vectorStr, userEmail, limit]
   );
@@ -173,21 +215,23 @@ export async function findSimilar(
   userEmail: string,
   limit: number
 ): Promise<any[]> {
-  // Get the source email's vector
-  const source = await db.query("SELECT embedding FROM emails WHERE id = $1", [
-    emailId,
-  ]);
-  if (source.rows.length === 0)
+  const col = activeEmbeddingColumn();
+  // Get the source email's vector for the active provider.
+  const source = await db.query(
+    `SELECT ${col} as embedding FROM emails WHERE id = $1`,
+    [emailId]
+  );
+  if (source.rows.length === 0 || !source.rows[0].embedding)
     throw new Error(
-      `Email ${emailId} not found in index. Index it first using gmail_index_emails.`
+      `Email ${emailId} not indexed for provider ${activeProvider()}. Run /reembed first.`
     );
 
   const result = await db.query(
     `SELECT id, thread_id, subject, from_addr, to_addr, date, snippet, body_preview,
-            1 - (embedding <=> $1::vector) as similarity
+            1 - (${col} <=> $1::vector) as similarity
      FROM emails
-     WHERE user_email = $2 AND id != $3
-     ORDER BY embedding <=> $1::vector
+     WHERE user_email = $2 AND id != $3 AND ${col} IS NOT NULL
+     ORDER BY ${col} <=> $1::vector
      LIMIT $4`,
     [source.rows[0].embedding, userEmail, emailId, limit]
   );

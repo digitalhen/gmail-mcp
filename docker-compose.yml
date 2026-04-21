@@ -33,6 +33,11 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       PERSONAL_TOKEN: "${PERSONAL_TOKEN}"
       PERSONAL_EMAIL: "${PERSONAL_EMAIL}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-transformers}"
+      OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
+      OLLAMA_EMBED_MODEL: "${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy

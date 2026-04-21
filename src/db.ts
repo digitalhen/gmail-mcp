@@ -58,23 +58,28 @@ class Database {
   }
 
   async createHnswIndexIfNeeded(): Promise<void> {
-    const result = await this.query(
-      "SELECT COUNT(*) as count FROM emails"
+    await this.createHnswIfNonNull("embedding", "idx_emails_embedding");
+    await this.createHnswIfNonNull("embedding_ollama", "idx_emails_embedding_ollama");
+  }
+
+  private async createHnswIfNonNull(column: string, indexName: string): Promise<void> {
+    const nonNull = await this.query(
+      `SELECT COUNT(*) as count FROM emails WHERE ${column} IS NOT NULL`
     );
-    const count = parseInt(result.rows[0].count);
+    const count = parseInt(nonNull.rows[0].count);
     if (count === 0) return;
 
-    // Check if index already exists
     const indexExists = await this.query(
-      "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_emails_embedding'"
+      "SELECT 1 FROM pg_indexes WHERE indexname = $1",
+      [indexName]
     );
     if (indexExists.rows.length > 0) return;
 
-    console.log(`[DB] Creating HNSW index on ${count} emails...`);
+    console.log(`[DB] Creating HNSW index ${indexName} on ${count} rows (${column})...`);
     await this.query(
-      "CREATE INDEX idx_emails_embedding ON emails USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)"
+      `CREATE INDEX ${indexName} ON emails USING hnsw (${column} vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
     );
-    console.log("[DB] HNSW index created");
+    console.log(`[DB] HNSW index ${indexName} created`);
   }
 
   private async cleanupExpiredTokens(client: PoolClient): Promise<void> {
@@ -262,6 +267,11 @@ class Database {
       ALTER TABLE emails ADD COLUMN IF NOT EXISTS body_full TEXT;
       ALTER TABLE email_enrichment ADD COLUMN IF NOT EXISTS enrichment_raw JSONB;
       ALTER TABLE emails ADD COLUMN IF NOT EXISTS is_promotional BOOLEAN DEFAULT FALSE;
+
+      -- Ollama-provided embeddings (768-dim, e.g. nomic-embed-text).
+      -- Coexists with the original 384-dim column so we can flip providers
+      -- via the EMBEDDING_PROVIDER flag without losing the other index.
+      ALTER TABLE emails ADD COLUMN IF NOT EXISTS embedding_ollama vector(768);
     `);
   }
 }

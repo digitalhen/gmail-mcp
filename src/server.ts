@@ -27,6 +27,8 @@ import {
   findSimilar,
   getIndexStats,
   generateEmbedding,
+  activeProvider,
+  activeEmbeddingColumn,
 } from "./vector-store.js";
 import { enrichEmail, getEnrichmentStats, canonicalizeEntity, isOwnerEntity } from "./enrichment.js";
 import {
@@ -2129,11 +2131,86 @@ async function main() {
     }
   });
 
+  // Backfill embeddings for the active provider (see EMBEDDING_PROVIDER).
+  // Walks all rows for PERSONAL_EMAIL where the active column is null and
+  // fills them in batch. Idempotent — safe to call repeatedly.
+  app.post("/reembed", async (req, res) => {
+    searchCors(req, res);
+    if (!personalToken || !personalEmail) {
+      res.status(503).json({ error: "PERSONAL_TOKEN and PERSONAL_EMAIL env vars not configured" });
+      return;
+    }
+    const authHeader = req.headers.authorization || "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (provided !== personalToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const col = activeEmbeddingColumn();
+    const provider = activeProvider();
+    const batchRaw = parseInt((req.query.batch as string) || "50", 10);
+    const batchSize = Number.isFinite(batchRaw) ? Math.min(Math.max(batchRaw, 1), 500) : 50;
+
+    try {
+      const pending = await db.query(
+        `SELECT COUNT(*) AS count FROM emails WHERE user_email = $1 AND ${col} IS NULL`,
+        [personalEmail]
+      );
+      const total = parseInt(pending.rows[0].count);
+      console.log(`[reembed] provider=${provider} col=${col} pending=${total}`);
+
+      let done = 0;
+      let failed = 0;
+      while (true) {
+        const rows = await db.query(
+          `SELECT id, subject, snippet, body_preview
+           FROM emails
+           WHERE user_email = $1 AND ${col} IS NULL
+           LIMIT $2`,
+          [personalEmail, batchSize]
+        );
+        if (rows.rows.length === 0) break;
+        for (const r of rows.rows) {
+          const text = `${r.subject || ""} ${r.snippet || ""} ${(r.body_preview || "").slice(0, 1000)}`;
+          try {
+            const vec = await generateEmbedding(text);
+            const vectorStr = `[${vec.join(",")}]`;
+            await db.query(
+              `UPDATE emails SET ${col} = $1::vector WHERE id = $2`,
+              [vectorStr, r.id]
+            );
+            done++;
+          } catch (err: any) {
+            failed++;
+            console.error(`[reembed] ${r.id}: ${err.message}`);
+          }
+        }
+        console.log(`[reembed] progress ${done}/${total} (${failed} failed)`);
+      }
+
+      // Create HNSW index if this was the first successful pass.
+      await db.createHnswIndexIfNeeded();
+
+      res.json({ provider, column: col, total, done, failed });
+    } catch (error: any) {
+      console.error("Reembed error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Health check (no auth required)
   app.get("/health", async (_req, res) => {
     try {
       await db.query("SELECT 1");
-      res.json({ status: "ok", server: "gmail-mcp", version: "1.0.0", database: "connected" });
+      res.json({
+        status: "ok",
+        server: "gmail-mcp",
+        version: "1.0.0",
+        database: "connected",
+        embeddingProvider: activeProvider(),
+        embeddingColumn: activeEmbeddingColumn(),
+      });
     } catch {
       res.status(503).json({ status: "error", server: "gmail-mcp", database: "disconnected" });
     }
