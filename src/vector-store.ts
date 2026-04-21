@@ -38,13 +38,20 @@ async function embedTransformers(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
-async function embedOllama(text: string): Promise<number[]> {
+async function embedOllama(text: string, role: "query" | "document"): Promise<number[]> {
   const base = (process.env.OLLAMA_URL || "http://host.docker.internal:11434").replace(/\/+$/, "");
   const model = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
+  // nomic-embed-text is trained with task prefixes — without them, retrieval
+  // quality collapses to noise. Other models may not need this, so only
+  // prefix if the model name matches.
+  const needsPrefix = model.includes("nomic-embed");
+  const input = needsPrefix
+    ? `${role === "query" ? "search_query" : "search_document"}: ${text}`
+    : text;
   const res = await fetch(`${base}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, input: text }),
+    body: JSON.stringify({ model, input }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -62,9 +69,12 @@ async function embedOllama(text: string): Promise<number[]> {
   return vec.map((v) => v / norm);
 }
 
-export async function generateEmbedding(text: string): Promise<number[]> {
+export async function generateEmbedding(
+  text: string,
+  role: "query" | "document" = "document"
+): Promise<number[]> {
   return activeProvider() === "ollama"
-    ? embedOllama(text)
+    ? embedOllama(text, role)
     : embedTransformers(text);
 }
 
@@ -109,7 +119,7 @@ export async function indexEmail(record: {
   // Strip HTML and generate embedding on clean text
   const cleanBody = stripHtml(record.bodyPreview);
   const text = `${record.subject} ${record.snippet} ${cleanBody.slice(0, 1000)}`;
-  const embedding = await generateEmbedding(text);
+  const embedding = await generateEmbedding(text, "document");
   const vectorStr = `[${embedding.join(",")}]`;
   const col = activeEmbeddingColumn();
 
@@ -183,7 +193,7 @@ export async function semanticSearch(
   userEmail: string,
   limit: number
 ): Promise<any[]> {
-  const embedding = await generateEmbedding(queryText);
+  const embedding = await generateEmbedding(queryText, "query");
   const vectorStr = `[${embedding.join(",")}]`;
   const col = activeEmbeddingColumn();
 
