@@ -2152,9 +2152,21 @@ async function main() {
     const batchRaw = parseInt((req.query.batch as string) || "50", 10);
     const batchSize = Number.isFinite(batchRaw) ? Math.min(Math.max(batchRaw, 1), 500) : 50;
     const force = req.query.force === "1" || req.query.force === "true";
+    const dimRaw = parseInt((req.query.dim as string) || "0", 10);
+    const newDim = Number.isFinite(dimRaw) && dimRaw > 0 ? dimRaw : null;
+    const indexName = col === "embedding_ollama" ? "idx_emails_embedding_ollama" : "idx_emails_embedding";
 
     try {
-      if (force) {
+      if (force && newDim) {
+        // Resize the column — destroys all vectors in it, which is fine
+        // because the caller is explicitly asking for a full reembed at a
+        // new dimensionality (e.g. swapping nomic-embed-text (768) for
+        // mxbai-embed-large (1024)).
+        console.log(`[reembed] resizing ${col} to vector(${newDim})`);
+        await db.query(`DROP INDEX IF EXISTS ${indexName}`);
+        await db.query(`ALTER TABLE emails DROP COLUMN IF EXISTS ${col}`);
+        await db.query(`ALTER TABLE emails ADD COLUMN ${col} vector(${newDim})`);
+      } else if (force) {
         const cleared = await db.query(
           `UPDATE emails SET ${col} = NULL WHERE user_email = $1 AND ${col} IS NOT NULL`,
           [personalEmail]
